@@ -1,11 +1,16 @@
 package spdy
 
+import (
+	"io"
+	"os"
+)
+
 // buffer is a fixed size buffer that is used for receiving data on the
 // session rx thread.
 type buffer struct {
 	begin int
-	end int
-	buf [defaultBufferSize*2]byte
+	end   int
+	buf   [defaultBufferSize * 2]byte
 }
 
 func (s *buffer) Get(r io.Reader, n int) ([]byte, os.Error) {
@@ -26,18 +31,17 @@ func (s *buffer) Get(r io.Reader, n int) ([]byte, os.Error) {
 		n = defaultBufferSize
 	}
 
-	for s.end - s.begin < n {
-		got, err := r.Read(s.buf[s.end:s.end+toget])
+	for s.end-s.begin < n {
+		got, err := r.Read(s.buf[s.end : s.end+toget])
 		s.end += got
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	return s.buf[s.begin:s.begin+n]
+	return s.buf[s.begin : s.begin+n], nil
 }
 
 func (s *buffer) Flush(n int) {
 	s.begin += n
 }
-
