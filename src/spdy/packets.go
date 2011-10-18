@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"url"
 )
 
 const (
@@ -206,7 +207,7 @@ type synStreamFrame struct {
 	AssociatedStreamId int
 	Header             http.Header
 	Priority           int
-	URL                *http.URL
+	URL                *url.URL
 	Proto              string
 	Method             string
 }
@@ -261,7 +262,7 @@ func parseSynStream(d []byte, c *decompressor) (s synStreamFrame, err os.Error) 
 
 	s.Proto = s.Header.Get(":version")
 	s.Method = s.Header.Get(":method")
-	u := &http.URL{
+	u := &url.URL{
 		Scheme: s.Header.Get(":scheme"),
 		Host:   s.Header.Get(":host"),
 		Path:   s.Header.Get(":path"),
