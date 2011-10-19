@@ -1,18 +1,46 @@
 package spdy
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/tls"
+	"fmt"
 	"http"
+	"log"
 	"net"
+	"runtime/debug"
 	"os"
 	"time"
 )
 
 func serverConnectThread(sock net.Conn, handler http.Handler, fallback chan net.Conn) {
-	// Hand the connection off to the standard HTTPS server
+	addr := sock.RemoteAddr()
+
+	defer func() {
+		err := recover()
+		sock.Close()
+		if err != nil {
+			var buf bytes.Buffer
+			fmt.Fprintf(&buf, "spdy: panic serving %s: %v\n", addr.String(), err)
+			buf.Write(debug.Stack())
+			log.Print(buf.String())
+		}
+	}()
+
+	version := 2
+
 	if t, ok := sock.(*tls.Conn); ok {
-		if t.ConnectionState().NegotiatedProtocol != "spdy/3" {
+		if err := t.Handshake(); err != nil {
+			return
+		}
+
+		switch t.ConnectionState().NegotiatedProtocol {
+		case "spdy/2":
+			version = 2
+		case "spdy/3":
+			version = 3
+		default:
+			// Hand the connection off to the standard HTTPS server
 			if fallback != nil {
 				fallback <- sock
 			} else {
@@ -22,8 +50,8 @@ func serverConnectThread(sock net.Conn, handler http.Handler, fallback chan net.
 		}
 	}
 
-	c := newConnection(sock.RemoteAddr(), handler, true)
-	c.run(sock)
+	c := NewConnection(sock, handler, version, true)
+	c.Run()
 }
 
 // serve runs the server accept loop
@@ -39,6 +67,8 @@ func serve(listener net.Listener, handler http.Handler, fallback chan net.Conn) 
 			return err
 		}
 
+		log.Printf("spdy: accept %s", sock.RemoteAddr())
+
 		// Do the TLS negotation on a seperate thread to avoid
 		// blocking the accept loop
 		go serverConnectThread(sock, handler, fallback)
@@ -47,10 +77,9 @@ func serve(listener net.Listener, handler http.Handler, fallback chan net.Conn) 
 	panic("unreachable")
 }
 
-// ListenAndServe listens for unencrypted SPDY connections on addr.
-//
-// Because it does not use TLS/SSL of this it can't use the next protocol
-// negotation in TLS to fall back on standard HTTP.
+// ListenAndServe listens for unencrypted SPDY connections on addr. Because it
+// does not use TLS/SSL of this it can't use the next protocol negotation in
+// TLS to fall back on standard HTTP.
 func ListenAndServe(addr string, handler http.Handler) os.Error {
 	if addr == "" {
 		addr = ":http"
@@ -63,7 +92,6 @@ func ListenAndServe(addr string, handler http.Handler) os.Error {
 }
 
 // ListenAndServeTLS listens for encrpyted SPDY or HTTPS connections on addr.
-//
 // It uses the TLS next negotation protocol to fallback on standard https.
 func ListenAndServeTLS(addr string, certFile string, keyFile string, handler http.Handler) os.Error {
 	if addr == "" {
@@ -72,7 +100,7 @@ func ListenAndServeTLS(addr string, certFile string, keyFile string, handler htt
 	cfg := &tls.Config{
 		Rand:         rand.Reader,
 		Time:         time.Seconds,
-		NextProtos:   []string{"spdy/3", "http/1.1"},
+		NextProtos:   []string{"http/1.1", "spdy/3", "spdy/2"},
 		Certificates: make([]tls.Certificate, 1),
 	}
 

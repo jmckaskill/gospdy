@@ -1,6 +1,7 @@
 package spdy
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/tls"
 	"fmt"
@@ -13,11 +14,14 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"testing/iotest"
 )
 
 // data in connections are only accessible on the connection dispatch thread
-type connection struct {
+type Connection struct {
 	// general connection info
+	socket     net.Conn
+	version    int
 	handler    http.Handler
 	remoteAddr net.Addr
 	tls        *tls.ConnectionState
@@ -36,12 +40,15 @@ type connection struct {
 	lastStreamOpened int
 	nextStreamId     int
 
+	goAway        bool
+	goAwayChannel chan bool
+
 	nextPingId uint32
 }
 
 // nextTxFrame gets the next frame to be written to the socket in prioritized
-// order.
-func nextTxFrame(control chan frame, data []chan frame) frame {
+// order. If it has to block it will flush the output buffer first.
+func nextTxFrame(control chan frame, data []chan frame, buf *bufio.Writer) frame {
 	// try a non-blocking receive in priority order
 	select {
 	case f := <-control:
@@ -56,6 +63,8 @@ func nextTxFrame(control chan frame, data []chan frame) frame {
 		default:
 		}
 	}
+
+	buf.Flush()
 
 	// do a blocking receive on all the send channels
 	select {
@@ -87,12 +96,16 @@ func nextTxFrame(control chan frame, data []chan frame) frame {
 // are prioritized by receiving from a number of send channels which are
 // polled from highest priority to lowest before blocking on them all.
 func txPump(sock io.WriteCloser, control chan frame, data []chan frame) {
+	buf := bufio.NewWriter(sock)
 	zip := compressor{}
+	out := iotest.NewWriteLogger("tx", sock)
 
 	for {
-		f := nextTxFrame(control, data)
+		f := nextTxFrame(control, data, buf)
 
-		if err := f.WriteTo(sock, &zip); err != nil {
+		log.Printf("spdy: tx %T %+v", f, f)
+
+		if err := f.WriteTo(out, &zip); err != nil {
 			break
 		}
 	}
@@ -106,16 +119,18 @@ func txPump(sock io.WriteCloser, control chan frame, data []chan frame) {
 func rxPump(sock io.ReadCloser, dispatch chan []byte, dispatched chan os.Error) {
 
 	buf := new(buffer)
+	read := iotest.NewReadLogger("spdy rx", sock)
 
 	for {
-		d, err := buf.Get(sock, 8)
+		d, err := buf.Get(read, 8)
 		if err != nil {
 			goto end
 		}
 
 		length := int(fromBig32(d[4:])&0xFFFFFF) + 8
+		log.Print(length)
 
-		d, err = buf.Get(sock, length)
+		d, err = buf.Get(read, length)
 		// If we get an error due to the buffer overflowing, then
 		// len(d) < 8 + length. We try and continue anyways, and the
 		// disptach thread can decide whether we need to throw a
@@ -154,12 +169,10 @@ end:
 
 // run runs the main connection thread which is responsible for dispatching
 // messages to the streams and managing the list of streams.
-//
-// TLS handshaking is done here before launching the tx and rx pump threads so
-// that the server accept loop is not held up.
-func (c *connection) run(sock net.Conn) {
+func (c *Connection) Run() {
 	var err os.Error
 	unzip := decompressor{}
+	sock := c.socket
 
 	if t, ok := sock.(*tls.Conn); ok {
 		if err := t.Handshake(); err != nil {
@@ -195,9 +208,8 @@ func (c *connection) run(sock net.Conn) {
 	}
 
 end:
-	streams := c.streams
-	c.streams = nil
-	for _, s := range streams {
+	close(c.goAwayChannel)
+	for _, s := range c.streams {
 		c.onStreamFinished(s, err)
 	}
 
@@ -215,14 +227,19 @@ end:
 // concerning this stream force a rstInvalidStream.
 //
 // Finally it recursively shuts down associated streams.
-func (c *connection) onStreamFinished(s *stream, err os.Error) {
-	if c.streams != nil {
-		c.streams[s.streamId] = nil, false
-	}
+func (c *Connection) onStreamFinished(s *stream, err os.Error) {
+	c.streams[s.streamId] = nil, false
 
 	// Disconnect child streams
 	for _, a := range s.children {
-		c.onStreamFinished(a, ErrAssociatedStreamClosed)
+		// Reset the parent pointer so the child doesn't try and
+		// remove itself from the parent
+		a.parent = nil
+		if err != nil {
+			c.onStreamFinished(a, err)
+		} else {
+			c.onStreamFinished(a, ErrAssociatedStreamClosed)
+		}
 	}
 
 	s.lock.Lock()
@@ -234,11 +251,11 @@ func (c *connection) onStreamFinished(s *stream, err os.Error) {
 	s.lock.Unlock()
 
 	// Remove ourself from our parent
-	if s.parent != nil && err != ErrAssociatedStreamClosed {
-		a := s.parent
-		for i, s2 := range a.children {
+	if s.parent != nil {
+		p := s.parent
+		for i, s2 := range p.children {
 			if s2 == s {
-				a.children = append(a.children[:i], a.children[i+1:]...)
+				p.children = append(p.children[:i], p.children[i+1:]...)
 				break
 			}
 		}
@@ -247,7 +264,7 @@ func (c *connection) onStreamFinished(s *stream, err os.Error) {
 
 // checkStreamFinished checks to see if we have successfully completed a
 // stream and shuts it down if so.
-func (c *connection) checkStreamFinished(s *stream) {
+func (c *Connection) checkStreamFinished(s *stream) {
 	// Also check c.streams to handle the case where the stream was
 	// aborted right after it finished. Strictly speaking we shouldn't
 	// read rxFinished without a lock and txFinished at all as they are
@@ -258,7 +275,15 @@ func (c *connection) checkStreamFinished(s *stream) {
 	}
 }
 
-func (c *connection) handleStartRequest(s *stream) {
+func (c *Connection) sendReset(streamId int, reason int) {
+	c.sendControl <- rstStreamFrame{
+		Version:  c.version,
+		StreamId: streamId,
+		Reason:   reason,
+	}
+}
+
+func (c *Connection) handleStartRequest(s *stream) {
 	s.streamId = c.nextStreamId
 	c.nextStreamId += 2
 
@@ -267,11 +292,11 @@ func (c *connection) handleStartRequest(s *stream) {
 		assocId = s.parent.streamId
 	}
 
-	if uint(s.streamId) > maxStreamId {
+	if uint(s.streamId) > maxStreamId || c.goAway {
 		// we haven't added the stream to
 		// s.parent.children so reset the parent.
 		s.parent = nil
-		c.onStreamFinished(s, ErrTooManyStreams)
+		c.onStreamFinished(s, ErrGoAway)
 		return
 	}
 
@@ -289,6 +314,7 @@ func (c *connection) handleStartRequest(s *stream) {
 	// SYN_STREAM packets are sent out in the order in which the stream
 	// ids were allocated
 	c.sendControl <- &synStreamFrame{
+		Version:            c.version,
 		StreamId:           s.streamId,
 		AssociatedStreamId: assocId,
 		Finished:           s.txFinished,
@@ -301,7 +327,7 @@ func (c *connection) handleStartRequest(s *stream) {
 	}
 }
 
-func handlerThread(h http.Handler, s *streamTx, req *http.Request) {
+func handlerThread(h http.Handler, s *streamTxUser, req *http.Request) {
 	defer func() {
 		s.Close()
 		err := recover()
@@ -318,29 +344,38 @@ func handlerThread(h http.Handler, s *streamTx, req *http.Request) {
 	h.ServeHTTP(s, req)
 }
 
-func (c *connection) handleSynStream(d []byte, unzip *decompressor) os.Error {
+func (c *Connection) handleSynStream(d []byte, unzip *decompressor) os.Error {
 	f, err := parseSynStream(d, unzip)
 	if err != nil {
 		return err
 	}
 
+	log.Printf("spdy: rx SYN_STREAM %+v", f)
+
 	// The remote has reopened an already opened stream. We kill both.
+	// Check this first as if any other check fails and this would've also
+	// failed sending out the reset will invalidate the existing stream.
 	if s2 := c.streams[f.StreamId]; s2 != nil {
-		c.sendControl <- rstStreamFrame{f.StreamId, rstProtocolError}
+		c.sendReset(f.StreamId, rstProtocolError)
 		c.onStreamFinished(s2, ErrStreamInUse)
+		return nil
+	}
+
+	if f.Version != c.version {
+		c.sendReset(f.StreamId, rstUnsupportedVersion)
 		return nil
 	}
 
 	// The remote tried to open a stream of the wrong type (eg its a
 	// client and tried to open a server stream).
 	if (f.StreamId & 1) == (c.nextStreamId & 1) {
-		c.sendControl <- rstStreamFrame{f.StreamId, rstProtocolError}
+		c.sendReset(f.StreamId, rstProtocolError)
 		return nil
 	}
 
 	// Stream Ids must monotonically increase
 	if f.StreamId <= c.lastStreamOpened {
-		c.sendControl <- rstStreamFrame{f.StreamId, rstProtocolError}
+		c.sendReset(f.StreamId, rstProtocolError)
 		return nil
 	}
 	c.lastStreamOpened = f.StreamId
@@ -354,13 +389,13 @@ func (c *connection) handleSynStream(d []byte, unzip *decompressor) os.Error {
 		// You are only allowed to open associated streams to streams
 		// that you are the recipient.
 		if (f.AssociatedStreamId & 1) != (c.nextStreamId & 1) {
-			c.sendControl <- rstStreamFrame{f.StreamId, rstProtocolError}
+			c.sendReset(f.StreamId, rstProtocolError)
 		}
 		parent = c.streams[f.AssociatedStreamId]
 		// The remote tried to open a stream associated with a closed
 		// stream. We kill this new stream.
 		if parent != nil {
-			c.sendControl <- rstStreamFrame{f.StreamId, rstInvalidStream}
+			c.sendReset(f.StreamId, rstInvalidStream)
 			return nil
 		}
 
@@ -368,7 +403,7 @@ func (c *connection) handleSynStream(d []byte, unzip *decompressor) os.Error {
 	}
 
 	if handler == nil {
-		c.sendControl <- rstStreamFrame{f.StreamId, rstRefusedStream}
+		c.sendReset(f.StreamId, rstRefusedStream)
 		return nil
 	}
 
@@ -409,7 +444,7 @@ func (c *connection) handleSynStream(d []byte, unzip *decompressor) os.Error {
 		URL:              f.URL,
 		Proto:            f.Proto,
 		Header:           f.Header,
-		Body:             (*streamRx)(s),
+		Body:             (*streamRxUser)(s),
 		TransferEncoding: []string{},
 		Close:            true,
 		Host:             f.URL.Host,
@@ -425,31 +460,39 @@ func (c *connection) handleSynStream(d []byte, unzip *decompressor) os.Error {
 		fmt.Sscanf(f.Proto[slash+1:], "%d.%d", &r.ProtoMajor, &r.ProtoMinor)
 	}
 
-	go handlerThread(handler, (*streamTx)(s), r)
+	go handlerThread(handler, (*streamTxUser)(s), r)
 
 	return nil
 }
 
-func (c *connection) handleSynReply(d []byte, unzip *decompressor) os.Error {
+func (c *Connection) handleSynReply(d []byte, unzip *decompressor) os.Error {
 	f, err := parseSynReply(d, unzip)
 	if err != nil {
 		return err
 	}
 
+	log.Printf("spdy: rx SYN_REPLY %+v", f)
+
 	s := c.streams[f.StreamId]
 	if s == nil {
-		c.sendControl <- rstStreamFrame{f.StreamId, rstInvalidStream}
+		c.sendReset(f.StreamId, rstInvalidStream)
+		return nil
+	}
+
+	if f.Version != c.version {
+		c.sendReset(f.StreamId, rstUnsupportedVersion)
+		c.onStreamFinished(s, ErrUnsupportedVersion)
 		return nil
 	}
 
 	if s.response != nil {
-		c.sendControl <- rstStreamFrame{f.StreamId, rstStreamInUse}
+		c.sendReset(f.StreamId, rstStreamInUse)
 		c.onStreamFinished(s, ErrStreamInUse)
 		return nil
 	}
 
 	if s.rxFinished {
-		c.sendControl <- rstStreamFrame{f.StreamId, rstStreamAlreadyClosed}
+		c.sendReset(f.StreamId, rstStreamAlreadyClosed)
 		c.onStreamFinished(s, ErrStreamAlreadyClosed)
 		return nil
 	}
@@ -458,7 +501,7 @@ func (c *connection) handleSynReply(d []byte, unzip *decompressor) os.Error {
 		Status:           f.Status,
 		Proto:            f.Proto,
 		Header:           f.Header,
-		Body:             (*streamRx)(s),
+		Body:             (*streamRxUser)(s),
 		TransferEncoding: []string{},
 		Close:            true,
 		Request:          s.request,
@@ -489,15 +532,23 @@ func (c *connection) handleSynReply(d []byte, unzip *decompressor) os.Error {
 	return nil
 }
 
-func (c *connection) handleHeaders(d []byte, unzip *decompressor) os.Error {
+func (c *Connection) handleHeaders(d []byte, unzip *decompressor) os.Error {
 	f, err := parseHeaders(d, unzip)
 	if err != nil {
 		return err
 	}
 
+	log.Printf("spdy: rx HEADERS %+v", f)
+
 	s := c.streams[f.StreamId]
 	if s == nil {
-		c.sendControl <- rstStreamFrame{f.StreamId, rstInvalidStream}
+		c.sendReset(f.StreamId, rstInvalidStream)
+		return nil
+	}
+
+	if f.Version != c.version {
+		c.sendReset(f.StreamId, rstUnsupportedVersion)
+		c.onStreamFinished(s, ErrUnsupportedVersion)
 		return nil
 	}
 
@@ -511,11 +562,13 @@ func (c *connection) handleHeaders(d []byte, unzip *decompressor) os.Error {
 	return nil
 }
 
-func (c *connection) handleRstStream(d []byte) os.Error {
+func (c *Connection) handleRstStream(d []byte) os.Error {
 	f, err := parseRstStream(d)
 	if err != nil {
 		return err
 	}
+
+	log.Printf("spdy: rx RST_STREAM %+v", f)
 
 	s := c.streams[f.StreamId]
 	if s == nil {
@@ -545,10 +598,16 @@ func (c *connection) handleRstStream(d []byte) os.Error {
 	return nil
 }
 
-func (c *connection) handleSettings(d []byte) os.Error {
+func (c *Connection) handleSettings(d []byte) os.Error {
 	f, err := parseSettings(d)
 	if err != nil {
 		return err
+	}
+
+	log.Printf("spdy: rx SETTINGS %+v", f)
+
+	if f.Version != c.version {
+		return ErrUnsupportedVersion
 	}
 
 	if !f.HaveWindow {
@@ -568,15 +627,23 @@ func (c *connection) handleSettings(d []byte) os.Error {
 	return nil
 }
 
-func (c *connection) handleWindowUpdate(d []byte) os.Error {
+func (c *Connection) handleWindowUpdate(d []byte) os.Error {
 	f, err := parseWindowUpdate(d)
 	if err != nil {
 		return err
 	}
 
+	log.Printf("spdy: rx WINDOW_UPDATE %+v", f)
+
 	s := c.streams[f.StreamId]
 	if s == nil {
-		c.sendControl <- rstStreamFrame{f.StreamId, rstInvalidStream}
+		c.sendReset(f.StreamId, rstInvalidStream)
+		return nil
+	}
+
+	if f.Version != c.version {
+		c.sendReset(f.StreamId, rstUnsupportedVersion)
+		c.onStreamFinished(s, ErrUnsupportedVersion)
 		return nil
 	}
 
@@ -588,34 +655,71 @@ func (c *connection) handleWindowUpdate(d []byte) os.Error {
 	return nil
 }
 
-func (c *connection) handlePing(d []byte) os.Error {
+func (c *Connection) handlePing(d []byte) os.Error {
 	f, err := parsePing(d)
 	if err != nil {
 		return err
 	}
 
+	log.Printf("spdy: rx PING %+v", f)
+
+	if f.Version != c.version {
+		return ErrUnsupportedVersion
+	}
+
 	// To ignore loopback pings we need to check the bottom bit.
 	if (f.Id & 1) != (c.nextPingId & 1) {
-		c.sendControl <- pingFrame{f.Id}
+		c.sendControl <- pingFrame{
+			Version: c.version,
+			Id:      f.Id,
+		}
 	}
 
 	return nil
 }
 
-func (c *connection) handleData(d []byte) os.Error {
+func (c *Connection) handleGoAway(d []byte) os.Error {
+	f, err := parseGoAway(d)
+	if err != nil {
+		return err
+	}
+
+	log.Printf("spdy: rx GO_AWAY %+v", f)
+
+	if f.Version != c.version {
+		return ErrUnsupportedVersion
+	}
+
+	// This is so we don't start any streams after this point
+	close(c.goAwayChannel)
+
+	for id, s := range c.streams {
+		// Reset all streams that we started which are after the last
+		// accepted stream
+		if id > f.LastStreamId && (id&1) == (c.nextStreamId&1) {
+			c.onStreamFinished(s, ErrGoAway)
+		}
+	}
+
+	return nil
+}
+
+func (c *Connection) handleData(d []byte) os.Error {
 	f, err := parseData(d)
 	if err != nil {
 		return err
 	}
 
+	log.Printf("spdy: rx DATA %+v", f)
+
 	s := c.streams[f.StreamId]
 	if s == nil {
-		c.sendControl <- rstStreamFrame{f.StreamId, rstInvalidStream}
+		c.sendReset(f.StreamId, rstInvalidStream)
 		return nil
 	}
 
 	if s.rxFinished {
-		c.sendControl <- rstStreamFrame{f.StreamId, rstStreamAlreadyClosed}
+		c.sendReset(f.StreamId, rstStreamAlreadyClosed)
 		c.onStreamFinished(s, ErrStreamAlreadyClosed)
 		return nil
 	}
@@ -623,17 +727,21 @@ func (c *connection) handleData(d []byte) os.Error {
 	// The rx pump thread could not give us the entire message due to it
 	// being too large.
 	if length := int(fromBig32(d[4:]) & 0xFFFFFF); length != len(f.Data) {
-		c.sendControl <- rstStreamFrame{f.StreamId, rstFlowControlError}
+		c.sendReset(f.StreamId, rstFlowControlError)
 		c.onStreamFinished(s, ErrFlowControl)
 		return nil
 	}
 
-	s.lock.Lock()
-
-	if s.rxBuffer == nil {
-		s.rxBuffer = bytes.NewBuffer(make([]byte, 0, len(f.Data)))
+	// Streams are not allowed to change from compress to non-compress mid
+	// way through
+	if s.rxData && s.rxCompressed != f.Compressed {
+		c.sendReset(f.StreamId, rstFlowControlError)
+		c.onStreamFinished(s, ErrFlowControl)
 	}
 
+	s.lock.Lock()
+	s.rxData = true
+	s.rxCompressed = f.Compressed
 	s.rxBuffer.Write(f.Data)
 	s.cond.Broadcast()
 	s.lock.Unlock()
@@ -641,25 +749,29 @@ func (c *connection) handleData(d []byte) os.Error {
 	if f.Finished {
 		s.rxFinished = true
 		c.checkStreamFinished(s)
-	} else {
-		c.sendControl <- windowUpdateFrame{s.streamId, len(f.Data)}
+	} else if c.version >= 3 {
+		c.sendControl <- windowUpdateFrame{
+			Version:     c.version,
+			StreamId:    s.streamId,
+			WindowDelta: len(f.Data),
+		}
 	}
 
 	return nil
 }
 
-func (c *connection) handleFrame(d []byte, unzip *decompressor) os.Error {
+func (c *Connection) handleFrame(d []byte, unzip *decompressor) os.Error {
 	code := fromBig32(d[0:])
 
 	if code&0x80000000 == 0 {
 		return c.handleData(d)
 	}
 
-	if length := int(fromBig32(d[4:]) & 0xFFFFFF); length != len(d) {
-		return parseError
+	if length := int(fromBig32(d[4:]) & 0xFFFFFF); length+8 != len(d) {
+		return ErrFlowControl
 	}
 
-	switch code {
+	switch code & 0x8000FFFF {
 	case synStreamCode:
 		return c.handleSynStream(d, unzip)
 
@@ -680,36 +792,39 @@ func (c *connection) handleFrame(d []byte, unzip *decompressor) os.Error {
 
 	case headersCode:
 		return c.handleHeaders(d, unzip)
+
+	case goAwayCode:
+		return c.handleGoAway(d)
 	}
 
-	ver := (code >> 16) & 0x7FFF
-	ctype := code & 0xFFFF
-
-	// Reply with unsupported version for SYN_STREAM. This should be
-	// sufficient as its the first message sent to open a stream. We can't
-	// cover the version in the general case, because we don't know what
-	// stream id to abort.
-	if ver != Version && ctype == synStreamControlType && len(d) > 12 {
-		streamId := int(fromBig32(d[8:]))
-		c.sendControl <- rstStreamFrame{streamId, rstUnsupportedVersion}
-	}
-
-	// Messages with the correct version but unknown type are ignored.
+	// Messages with unknown type are ignored.
 
 	return nil
 }
 
-// newConnection allocates a new connection
-func newConnection(remoteAddr net.Addr, handler http.Handler, server bool) *connection {
-	c := &connection{
+// NewConnection creates a SPDY client or server connection around sock.
+//
+// sock should be the underlying socket already connected. Typically this is a
+// TLS connection which has already gone the next protocol negotiation, but
+// any socket will work.
+//
+// Handler is used to provide the callback for any content pushed from the
+// server. If it is nil then pushed streams are refused.
+//
+// The connection won't be started until you run Connection.Run()
+func NewConnection(sock net.Conn, handler http.Handler, version int, server bool) *Connection {
+	c := &Connection{
+		socket:           sock,
+		version:          version,
 		handler:          handler,
-		remoteAddr:       remoteAddr,
+		remoteAddr:       sock.RemoteAddr(),
 		rxWindow:         defaultWindow,
-		sendControl:      make(chan frame),
+		sendControl:      make(chan frame, 100),
 		onStartRequest:   make(chan *stream),
 		onFinishedSent:   make(chan *stream),
 		streams:          make(map[int]*stream),
 		lastStreamOpened: 0,
+		goAwayChannel:    make(chan bool),
 	}
 
 	for i := 0; i < len(c.sendData); i++ {

@@ -2,3 +2,6 @@
 *.6
 _obj
 /pkg
+_test
+_testmain.go
+*.out

@@ -32,6 +32,7 @@ func (s *buffer) Get(r io.Reader, n int) ([]byte, os.Error) {
 	}
 
 	for s.end-s.begin < n {
+		println("read")
 		got, err := r.Read(s.buf[s.end : s.end+toget])
 		s.end += got
 		if err != nil {
