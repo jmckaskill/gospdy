@@ -11,7 +11,7 @@ func TestListenAndServe(t *testing.T) {
 }
 
 func TestListenAndServeTLS(t *testing.T) {
-	if err := ListenAndServeTLS(":443", "foobar.co.nz.crt", "foobar.co.nz.key", nil); err != nil {
+	if err := ListenAndServeTLS(":443", "foobar.co.nz.crt", "foobar.co.nz.pem", nil); err != nil {
 		t.Error(err)
 	}
 }

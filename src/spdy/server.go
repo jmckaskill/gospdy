@@ -16,21 +16,25 @@ import (
 func serverConnectThread(sock net.Conn, handler http.Handler, fallback chan net.Conn) {
 	addr := sock.RemoteAddr()
 
-	defer func() {
-		err := recover()
-		sock.Close()
-		if err != nil {
-			var buf bytes.Buffer
-			fmt.Fprintf(&buf, "spdy: panic serving %s: %v\n", addr.String(), err)
-			buf.Write(debug.Stack())
-			log.Print(buf.String())
-		}
-	}()
-
 	version := 2
 
 	if t, ok := sock.(*tls.Conn); ok {
 		if err := t.Handshake(); err != nil {
+			return
+		}
+
+		s := t.ConnectionState()
+
+		if !s.NegotiatedProtocolIsMutual ||
+			s.NegotiatedProtocol == "" ||
+			s.NegotiatedProtocol == "http/1.1" {
+
+			// Hand the connection off to the standard HTTPS server
+			if fallback != nil {
+				fallback <- sock
+			} else {
+				sock.Close()
+			}
 			return
 		}
 
@@ -40,15 +44,18 @@ func serverConnectThread(sock net.Conn, handler http.Handler, fallback chan net.
 		case "spdy/3":
 			version = 3
 		default:
-			// Hand the connection off to the standard HTTPS server
-			if fallback != nil {
-				fallback <- sock
-			} else {
-				sock.Close()
-			}
-			return
+			panic("spdy-internal: unexpected negotiated protocol")
 		}
 	}
+
+	defer func() {
+		if err := recover(); err != nil {
+			var buf bytes.Buffer
+			fmt.Fprintf(&buf, "spdy: panic serving %s: %v\n", addr.String(), err)
+			buf.Write(debug.Stack())
+			log.Print(buf.String())
+		}
+	}()
 
 	c := NewConnection(sock, handler, version, true)
 	c.Run()
@@ -100,7 +107,7 @@ func ListenAndServeTLS(addr string, certFile string, keyFile string, handler htt
 	cfg := &tls.Config{
 		Rand:         rand.Reader,
 		Time:         time.Seconds,
-		NextProtos:   []string{"http/1.1", "spdy/3", "spdy/2"},
+		NextProtos:   []string{"spdy/3", "spdy/2", "http/1.1"},
 		Certificates: make([]tls.Certificate, 1),
 	}
 
@@ -130,6 +137,41 @@ func ListenAndServeTLS(addr string, certFile string, keyFile string, handler htt
 	return err
 }
 
+type connLogger struct {
+	net.Conn
+	prefix string
+}
+
+func (l *connLogger) Close() (err os.Error) {
+	err = l.Conn.Close()
+	if err != nil {
+		log.Printf("%s Close: %v", l.prefix, err)
+	} else {
+		log.Printf("%s Close", l.prefix)
+	}
+	return
+}
+
+func (l *connLogger) Read(p []byte) (n int, err os.Error) {
+	n, err = l.Conn.Read(p)
+	if err != nil {
+		log.Printf("%s Read %s: %v", l.prefix, p[0:n], err)
+	} else {
+		log.Printf("%s Read %s", l.prefix, p[0:n])
+	}
+	return
+}
+
+func (l *connLogger) Write(p []byte) (n int, err os.Error) {
+	n, err = l.Conn.Write(p)
+	if err != nil {
+		log.Printf("%s Write %s: %v", l.prefix, p[0:n], err)
+	} else {
+		log.Printf("%s Write %s", l.prefix, p[0:n])
+	}
+	return
+}
+
 // httpsListener is a fake listener for feeding to the standard HTTPS server.
 //
 // This is so that we can hand it connections which negotiate https as their
@@ -145,7 +187,8 @@ func (s *httpsListener) Accept() (net.Conn, os.Error) {
 	case err := <-s.error:
 		return nil, err
 	case sock := <-s.accept:
-		return sock, nil
+		log.Print(sock.RemoteAddr())
+		return &connLogger{sock, "https"}, nil
 	}
 	panic("unreachable")
 }

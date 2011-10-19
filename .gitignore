@@ -5,3 +5,8 @@ _obj
 _test
 _testmain.go
 *.out
+/src/server/server
+.AppleDouble
+/bin
+/*.crt
+/*.key

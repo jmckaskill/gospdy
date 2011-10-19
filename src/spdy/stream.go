@@ -241,6 +241,10 @@ func (s *streamTxUser) Write(data []byte) (n int, err os.Error) {
 		return 0, ErrWriteAfterClose
 	}
 
+	if len(data) == 0 {
+		return 0, nil
+	}
+
 	if !s.headerWritten {
 		s.WriteHeader(http.StatusOK)
 	}
@@ -265,10 +269,30 @@ func (s *streamTxUser) Close() os.Error {
 		return ErrWriteAfterClose
 	}
 
-	s.txClosed = true
+	// If we have written any data then we don't want the reply to say we
+	// are finished, but we want to be able to close the txWriter, instead
+	// of flushing it as zlib will produce different output using a flush
+	// vs a close.
+	if s.txWriter != nil {
+		if s.shouldSendReply {
+			if err := (*streamTxOut)(s).sendReply(); err != nil {
+				return err
+			}
+		}
 
-	if err := s.Close(); err != nil {
-		return err
+		s.txClosed = true
+
+		if err := s.txWriter.Close(); err != nil {
+			return err
+		}
+	} else {
+		s.txClosed = true
+
+		if s.shouldSendReply {
+			if err := (*streamTxOut)(s).sendReply(); err != nil {
+				return err
+			}
+		}
 	}
 
 	// In most cases the close will have already been sent with the last

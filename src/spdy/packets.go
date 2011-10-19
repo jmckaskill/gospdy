@@ -3,12 +3,12 @@ package spdy
 import (
 	"bytes"
 	"compress/zlib"
+	"fmt"
 	"http"
 	"io"
 	"log"
 	"os"
 	"strings"
-	"testing/iotest"
 	"url"
 )
 
@@ -103,7 +103,7 @@ func (s *decompressor) Decompress(version int, data []byte) (headers http.Header
 	if s.out == nil {
 		switch version {
 		case 2:
-			s.out, err = zlib.NewReaderDict(iotest.NewReadLogger("zrx", s.in), []byte(headerDictionaryV2))
+			s.out, err = zlib.NewReaderDict(s.in, []byte(headerDictionaryV2))
 		case 3:
 			s.out, err = zlib.NewReaderDict(s.in, []byte(headerDictionaryV3))
 		default:
@@ -133,7 +133,6 @@ func (s *decompressor) Decompress(version int, data []byte) (headers http.Header
 	default:
 		return nil, ErrUnsupportedVersion
 	}
-	println(numkeys)
 
 	headers = make(http.Header)
 	for i := 0; i < numkeys; i++ {
@@ -166,7 +165,6 @@ func (s *decompressor) Decompress(version int, data []byte) (headers http.Header
 		if _, err := s.out.Read(key); err != nil {
 			return nil, err
 		}
-		println(string(key))
 
 		// Pull out the value
 
@@ -198,7 +196,6 @@ func (s *decompressor) Decompress(version int, data []byte) (headers http.Header
 
 		// Split the value on nul boundaries
 		for _, val := range bytes.Split(val, []byte{'\x00'}) {
-			println(string(val))
 			headers.Add(string(key), string(val))
 		}
 	}
@@ -207,9 +204,8 @@ func (s *decompressor) Decompress(version int, data []byte) (headers http.Header
 }
 
 type compressor struct {
-	buf  *bytes.Buffer
-	zlib *zlib.Writer
-	w    io.Writer
+	buf *bytes.Buffer
+	w   *zlib.Writer
 }
 
 func (s *compressor) Begin(version int, init []byte, headers http.Header, numkeys int) (err os.Error) {
@@ -219,9 +215,9 @@ func (s *compressor) Begin(version int, init []byte, headers http.Header, numkey
 
 		switch version {
 		case 2:
-			s.zlib, err = zlib.NewWriterDict(iotest.NewWriteLogger("ztx", s.buf), compressionLevel, []byte(headerDictionaryV2))
+			s.w, err = zlib.NewWriterDict(s.buf, compressionLevel, []byte(headerDictionaryV2))
 		case 3:
-			s.zlib, err = zlib.NewWriterDict(iotest.NewWriteLogger("ztx", s.buf), compressionLevel, []byte(headerDictionaryV3))
+			s.w, err = zlib.NewWriterDict(s.buf, compressionLevel, []byte(headerDictionaryV3))
 		default:
 			err = ErrUnsupportedVersion
 		}
@@ -229,8 +225,6 @@ func (s *compressor) Begin(version int, init []byte, headers http.Header, numkey
 		if err != nil {
 			return err
 		}
-
-		s.w = iotest.NewWriteLogger("ztx write", s.zlib)
 
 	} else {
 		s.buf.Reset()
@@ -254,7 +248,6 @@ func (s *compressor) Begin(version int, init []byte, headers http.Header, numkey
 			if len(key) > 0 && key[0] != ':' {
 				var k, v [2]byte
 				vals := strings.Join(val, "\x00")
-				log.Printf("%s = %s", key, vals)
 
 				toBig16(k[:], uint16(len(key)))
 				s.w.Write(k[:])
@@ -295,7 +288,6 @@ func (s *compressor) Begin(version int, init []byte, headers http.Header, numkey
 
 func (s *compressor) CompressV2(key string, val string) {
 	var k, v [2]byte
-	log.Printf("%s = %s", key, val)
 	toBig16(k[:], uint16(len(key)))
 	toBig16(v[:], uint16(len(val)))
 	s.w.Write(k[:])
@@ -315,7 +307,7 @@ func (s *compressor) CompressV3(key string, val string) {
 }
 
 func (s *compressor) Finish() []byte {
-	s.zlib.Flush()
+	s.w.Flush()
 	return s.buf.Bytes()
 }
 
@@ -337,6 +329,8 @@ type synStreamFrame struct {
 }
 
 func (s *synStreamFrame) WriteTo(w io.Writer, c *compressor) os.Error {
+	log.Printf("spdy: tx SYN_STREAM %+v", *s)
+
 	flags := uint32(0)
 	if s.Finished {
 		flags |= finishedFlag << 24
@@ -406,51 +400,31 @@ func parseSynStream(d []byte, c *decompressor) (s synStreamFrame, err os.Error) 
 		return s, err
 	}
 
-	var u *url.URL
-
-	log.Print(s.Header)
+	var scheme, host, path string
 
 	switch s.Version {
 	case 2:
 		s.Proto = s.Header.Get("Version")
 		s.Method = s.Header.Get("Method")
-		u = &url.URL{
-			Scheme: s.Header.Get("Scheme"),
-			Host:   s.Header.Get("Host"),
-			Path:   s.Header.Get("Url"),
-		}
+		scheme = s.Header.Get("Scheme")
+		host = s.Header.Get("Host")
+		path = s.Header.Get("Url")
 	case 3:
 		s.Proto = s.Header.Get(":version")
 		s.Method = s.Header.Get(":method")
-		u = &url.URL{
-			Scheme: s.Header.Get(":scheme"),
-			Host:   s.Header.Get(":host"),
-			Path:   s.Header.Get(":path"),
-		}
+		scheme = s.Header.Get(":scheme")
+		host = s.Header.Get(":host")
+		path = s.Header.Get(":path")
 	default:
 		return s, ErrUnsupportedVersion
 	}
 
-	if q := strings.Index(u.Path, "?"); q > 0 {
-		u.RawQuery = u.Path[q+1:]
-		u.Path = u.Path[:q]
-	}
-
-	if len(s.Proto) == 0 ||
-		len(s.Method) == 0 ||
-		len(u.Scheme) == 0 ||
-		len(u.Host) == 0 ||
-		len(u.Path) == 0 ||
-		u.Path[0] != '/' {
-
-		log.Print("test", s.Proto, s.Method, u.Scheme, u.Host, u.Path)
-		return s, ErrParse
+	s.URL, err = url.Parse(fmt.Sprintf("%s://%s%s", scheme, host, path))
+	if err != nil || len(path) == 0 || path[0] != '/' {
+		return s, err
 	}
 
 	// TODO(james): error on not allowed headers (eg Connection)
-
-	u.Raw = u.String()
-	s.URL = u
 
 	return s, err
 }
@@ -465,6 +439,8 @@ type synReplyFrame struct {
 }
 
 func (s *synReplyFrame) WriteTo(w io.Writer, c *compressor) os.Error {
+	log.Printf("spdy: tx SYN_REPLY %+v", *s)
+
 	flags := uint32(0)
 	if s.Finished {
 		flags |= finishedFlag << 24
@@ -546,6 +522,8 @@ type headersFrame struct {
 }
 
 func (s *headersFrame) WriteTo(w io.Writer, c *compressor) os.Error {
+	log.Printf("spdy: tx HEADERS %+v", *s)
+
 	flags := uint32(0)
 	if s.Finished {
 		flags |= finishedFlag << 24
@@ -611,6 +589,7 @@ type rstStreamFrame struct {
 }
 
 func (s rstStreamFrame) WriteTo(w io.Writer, c *compressor) os.Error {
+	log.Printf("spdy: tx RST_STREAM %+v", s)
 	h := [16]byte{}
 	toBig32(h[0:], rstStreamCode|uint32(s.Version<<16))
 	toBig32(h[4:], 8) // length and no flags
@@ -643,6 +622,7 @@ type windowUpdateFrame struct {
 }
 
 func (s windowUpdateFrame) WriteTo(w io.Writer, c *compressor) os.Error {
+	log.Printf("spdy: tx WINDOW_UPDATE %+v", s)
 	h := [16]byte{}
 	toBig32(h[0:], windowUpdateCode|uint32(s.Version<<16))
 	toBig32(h[4:], 8) // length and no flags
@@ -678,6 +658,7 @@ func (s settingsFrame) WriteTo(w io.Writer, c *compressor) os.Error {
 	if !s.HaveWindow {
 		return nil
 	}
+	log.Printf("spdy: tx SETTINGS %+v", s)
 
 	h := [20]byte{}
 	toBig32(h[0:], settingsCode|uint32(s.Version<<16))
@@ -760,6 +741,7 @@ type pingFrame struct {
 }
 
 func (s pingFrame) WriteTo(w io.Writer, c *compressor) os.Error {
+	log.Printf("spdy: tx PING %+v", s)
 	h := [12]byte{}
 	toBig32(h[0:], pingCode|uint32(s.Version<<16))
 	toBig32(h[4:], 4) // length 4 and no flags
@@ -784,6 +766,7 @@ type goAwayFrame struct {
 }
 
 func (s goAwayFrame) WriteTo(w io.Writer, c *compressor) (err os.Error) {
+	log.Printf("spdy: tx GO_AWAY %+v", s)
 	h := [16]byte{}
 	toBig32(h[0:], goAwayCode|uint32(s.Version<<16))
 	toBig32(h[4:], 8) // length 8 and no flags
@@ -839,6 +822,9 @@ type dataFrame struct {
 }
 
 func (s dataFrame) WriteTo(w io.Writer, c *compressor) os.Error {
+	log.Printf("spdy: tx DATA {StreamId: %d Finished: %v Compressed: %v, Data: len %d}",
+		s.StreamId, s.Finished, s.Compressed, len(s.Data))
+
 	flags := uint32(0)
 	if s.Finished {
 		flags |= finishedFlag << 24

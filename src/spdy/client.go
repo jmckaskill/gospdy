@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"http"
 	"io"
-	"log"
 	"net"
 	"os"
 	"sync"
@@ -143,7 +142,6 @@ func connKey(proxy *url.URL, req *http.Request) string {
 }
 
 func (t *Transport) dialProxy(proxy *url.URL, addr string) (net.Conn, os.Error) {
-	log.Printf("dialProxy %+v %s", proxy, addr)
 	dial := t.Dial
 	if dial == nil {
 		dial = net.Dial

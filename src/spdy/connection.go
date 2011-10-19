@@ -14,7 +14,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"testing/iotest"
 )
 
 // data in connections are only accessible on the connection dispatch thread
@@ -98,14 +97,11 @@ func nextTxFrame(control chan frame, data []chan frame, buf *bufio.Writer) frame
 func txPump(sock io.WriteCloser, control chan frame, data []chan frame) {
 	buf := bufio.NewWriter(sock)
 	zip := compressor{}
-	out := iotest.NewWriteLogger("tx", sock)
 
 	for {
 		f := nextTxFrame(control, data, buf)
 
-		log.Printf("spdy: tx %T %+v", f, f)
-
-		if err := f.WriteTo(out, &zip); err != nil {
+		if err := f.WriteTo(sock, &zip); err != nil {
 			break
 		}
 	}
@@ -119,18 +115,16 @@ func txPump(sock io.WriteCloser, control chan frame, data []chan frame) {
 func rxPump(sock io.ReadCloser, dispatch chan []byte, dispatched chan os.Error) {
 
 	buf := new(buffer)
-	read := iotest.NewReadLogger("spdy rx", sock)
 
 	for {
-		d, err := buf.Get(read, 8)
+		d, err := buf.Get(sock, 8)
 		if err != nil {
 			goto end
 		}
 
 		length := int(fromBig32(d[4:])&0xFFFFFF) + 8
-		log.Print(length)
 
-		d, err = buf.Get(read, length)
+		d, err = buf.Get(sock, length)
 		// If we get an error due to the buffer overflowing, then
 		// len(d) < 8 + length. We try and continue anyways, and the
 		// disptach thread can decide whether we need to throw a
@@ -228,6 +222,12 @@ end:
 //
 // Finally it recursively shuts down associated streams.
 func (c *Connection) onStreamFinished(s *stream, err os.Error) {
+	if err != nil {
+		log.Printf("spdy: stream %d finished: %v", s.streamId, err)
+	} else {
+		log.Printf("spdy: stream %d finished", s.streamId)
+	}
+
 	c.streams[s.streamId] = nil, false
 
 	// Disconnect child streams
@@ -440,7 +440,7 @@ func (c *Connection) handleSynStream(d []byte, unzip *decompressor) os.Error {
 
 	r := &http.Request{
 		Method:           f.Method,
-		RawURL:           f.URL.String(),
+		RawURL:           f.URL.RawPath,
 		URL:              f.URL,
 		Proto:            f.Proto,
 		Header:           f.Header,
