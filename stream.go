@@ -83,6 +83,7 @@ type flushWriteCloser interface {
 type RequestExtra struct {
 	Unidirectional    bool
 	Priority          int
+	Buffered          bool
 	Compressed        bool
 	AssociatedHandler http.Handler
 }
@@ -95,6 +96,7 @@ type Stream interface {
 	EnableOutputCompression(compressed bool)
 	EnableOutputBuffering(buffering bool)
 	PushRequest(req *http.Request, extra *RequestExtra) (*http.Response, os.Error)
+	RoundTrip(r *http.Request) (*http.Response, os.Error)
 }
 
 // Split the user accessible stream methods into seperate sets
@@ -115,15 +117,15 @@ type streamRxUser stream
 // Seperate type so we can do transparent decompression
 type streamRxIn stream
 
-func (c *Connection) newStream(req *http.Request, rxFinished, txFinished bool, txPriority int) *stream {
+func (c *Connection) newStream(req *http.Request, txFinished bool, extra *RequestExtra) *stream {
 	s := new(stream)
 	s.connection = c
 	s.request = req
 	s.isRecipient = false
 
 	s.rxCond = sync.NewCond(&s.rxLock)
-	s.rxFinished = rxFinished
-	s.rxClosed = rxFinished
+	s.rxFinished = extra.Unidirectional
+	s.rxClosed = extra.Unidirectional
 
 	s.txCond = sync.NewCond(&s.txLock)
 	s.txWindow = defaultWindow
@@ -132,8 +134,10 @@ func (c *Connection) newStream(req *http.Request, rxFinished, txFinished bool, t
 
 	s.txClosed = txFinished
 	s.txFinished = txFinished
-	s.txPriority = txPriority
-	s.txBuffered = true
+	s.txPriority = extra.Priority
+	s.txBuffered = extra.Compressed
+
+	s.childHandler = extra.AssociatedHandler
 	return s
 }
 
@@ -212,16 +216,12 @@ func (s *streamRxUser) Close() os.Error {
 }
 
 // PushRequest starts a new pushed request associated with this request.
-//
-// To change the priority of the request set the ":priority" header field to a
-// number between 0 (highest) and MaxPriority-1 (lowest). Otherwise
-// DefaultPriority will be used.
-//
-// To start an unidirectional request where we do not wait for the response,
-// set the ":unidirectional" header to a non empty value. The return value
-// resp will then be nil.
 func (s *streamTxUser) PushRequest(req *http.Request, extra *RequestExtra) (resp *http.Response, err os.Error) {
 	return s.connection.startRequest((*stream)(s), req, extra)
+}
+
+func (s *streamTxUser) RoundTrip(req *http.Request) (*http.Response, os.Error) {
+	return s.PushRequest(req, nil)
 }
 
 // Header returns the response header so that headers can be changed.

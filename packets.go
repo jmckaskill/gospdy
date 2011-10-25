@@ -315,7 +315,13 @@ func (s *compressor) Finish() []byte {
 }
 
 type frame interface {
-	WriteTo(w io.Writer, c *compressor) os.Error
+	WritePacket(w io.Writer, c *compressor) os.Error
+}
+
+func popHeader(h http.Header, key string) string {
+	r := h.Get(key)
+	h.Del(key)
+	return r
 }
 
 type synStreamFrame struct {
@@ -327,13 +333,21 @@ type synStreamFrame struct {
 	Header             http.Header
 	Priority           int
 	URL                *url.URL
+	Host               string
 	Proto              string
 	ProtoMajor         int
 	ProtoMinor         int
 	Method             string
 }
 
-func (s *synStreamFrame) WriteTo(w io.Writer, c *compressor) os.Error {
+var invalidSynStreamHeaders = []string{
+	"Connection",
+	"Keep-Alive",
+	"Proxy-Connection",
+	"Transfer-Encoding",
+}
+
+func (s *synStreamFrame) WritePacket(w io.Writer, c *compressor) os.Error {
 	log.Printf("spdy: tx SYN_STREAM %+v", *s)
 
 	flags := uint32(0)
@@ -344,7 +358,11 @@ func (s *synStreamFrame) WriteTo(w io.Writer, c *compressor) os.Error {
 		flags |= unidirectionalFlag << 24
 	}
 
-	// TODO(james): error on not allowed headers (eg Connection)
+	if s.Header != nil {
+		for _, key := range invalidSynStreamHeaders {
+			delete(s.Header, key)
+		}
+	}
 
 	if err := c.Begin(s.Version, [18]byte{}[:], s.Header, 5); err != nil {
 		return err
@@ -360,13 +378,13 @@ func (s *synStreamFrame) WriteTo(w io.Writer, c *compressor) os.Error {
 		c.CompressV2("version", s.Proto)
 		c.CompressV2("method", s.Method)
 		c.CompressV2("url", path)
-		c.CompressV2("host", s.URL.Host)
+		c.CompressV2("host", s.Host)
 		c.CompressV2("scheme", s.URL.Scheme)
 	case 3:
 		c.CompressV3(":version", s.Proto)
 		c.CompressV3(":method", s.Method)
 		c.CompressV3(":path", path)
-		c.CompressV3(":host", s.URL.Host)
+		c.CompressV3(":host", s.Host)
 		c.CompressV3(":scheme", s.URL.Scheme)
 	default:
 		return ErrStreamVersion{s.StreamId, s.Version}
@@ -388,12 +406,14 @@ func (s *synStreamFrame) WriteTo(w io.Writer, c *compressor) os.Error {
 
 func parseSynStream(d []byte, c *decompressor) (s synStreamFrame, err os.Error) {
 	if len(d) < 12 {
+		log.Print("spdy: invalid SYN_STREAM length")
 		return s, ErrParse(d)
 	}
 
 	s.StreamId = int(fromBig32(d[8:]))
 
 	if len(d) < 18 {
+		log.Print("spdy: invalid SYN_STREAM length")
 		return s, ErrStreamProtocol(s.StreamId)
 	}
 
@@ -404,10 +424,12 @@ func parseSynStream(d []byte, c *decompressor) (s synStreamFrame, err os.Error) 
 	s.Priority = int(d[16]>>5) + HighPriority
 
 	if s.StreamId <= 0 || s.AssociatedStreamId < 0 {
+		log.Print("spdy: invalid stream or associated stream id")
 		return s, ErrStreamProtocol(s.StreamId)
 	}
 
 	if s.Header, err = c.Decompress(s.StreamId, s.Version, d[18:]); err != nil {
+		log.Printf("spdy: SYN_STREAM decompress error: %v", err)
 		return s, err
 	}
 
@@ -415,39 +437,42 @@ func parseSynStream(d []byte, c *decompressor) (s synStreamFrame, err os.Error) 
 
 	switch s.Version {
 	case 2:
-		s.Proto = s.Header.Get("Version")
-		s.Method = s.Header.Get("Method")
-		scheme = s.Header.Get("Scheme")
-		host = s.Header.Get("Host")
-		path = s.Header.Get("Url")
+		s.Proto = popHeader(s.Header, "Version")
+		s.Method = popHeader(s.Header, "Method")
+		scheme = popHeader(s.Header, "Scheme")
+		host = popHeader(s.Header, "Host")
+		path = popHeader(s.Header, "Url")
 	case 3:
-		s.Proto = s.Header.Get(":version")
-		s.Method = s.Header.Get(":method")
-		scheme = s.Header.Get(":scheme")
-		host = s.Header.Get(":host")
-		path = s.Header.Get(":path")
+		s.Proto = popHeader(s.Header, ":version")
+		s.Method = popHeader(s.Header, ":method")
+		scheme = popHeader(s.Header, ":scheme")
+		host = popHeader(s.Header, ":host")
+		path = popHeader(s.Header, ":path")
 	default:
+		log.Printf("spdy: SYN_STREAM unsupported version %d", s.Version)
 		return s, ErrStreamVersion{s.StreamId, s.Version}
 	}
 
 	var ok bool
 	if s.ProtoMajor, s.ProtoMinor, ok = http.ParseHTTPVersion(s.Proto); !ok {
+		log.Printf("spdy: SYN_STREAM could not parse http version %s", s.Proto)
 		return s, ErrStreamProtocol(s.StreamId)
 	}
 
 	s.URL, err = url.Parse(path)
 	if err != nil || len(path) == 0 || path[0] != '/' {
+		log.Printf("spdy: invalid SYN_STREAM path %s: %v", path, err)
 		return s, ErrStreamProtocol(s.StreamId)
 	}
 	s.URL.Scheme = scheme
 	s.URL.Host = host
+	s.Host = host
 
-	if s.Header["Connection"] != nil ||
-		s.Header["Keep-Alive"] != nil ||
-		s.Header["Proxy-Connection"] != nil ||
-		s.Header["Transfer-Encoding"] != nil {
-
-		return s, ErrStreamProtocol(s.StreamId)
+	for _, key := range invalidSynStreamHeaders {
+		if s.Header[key] != nil {
+			log.Printf("spdy: invalid SYN_STREAM header %s: %s", key, s.Header.Get(key))
+			return s, ErrStreamProtocol(s.StreamId)
+		}
 	}
 
 	return s, err
@@ -464,7 +489,14 @@ type synReplyFrame struct {
 	ProtoMinor int
 }
 
-func (s *synReplyFrame) WriteTo(w io.Writer, c *compressor) os.Error {
+var invalidSynReplyHeaders = []string{
+	"Connection",
+	"Keep-Alive",
+	"Proxy-Connection",
+	"Transfer-Encoding",
+}
+
+func (s *synReplyFrame) WritePacket(w io.Writer, c *compressor) os.Error {
 	log.Printf("spdy: tx SYN_REPLY %+v", *s)
 
 	flags := uint32(0)
@@ -472,7 +504,11 @@ func (s *synReplyFrame) WriteTo(w io.Writer, c *compressor) os.Error {
 		flags |= finishedFlag << 24
 	}
 
-	// TODO(james): error on not allowed headers (eg Connection)
+	if s.Header != nil {
+		for _, key := range invalidSynReplyHeaders {
+			delete(s.Header, key)
+		}
+	}
 
 	switch s.Version {
 	case 2:
@@ -521,14 +557,14 @@ func parseSynReply(d []byte, c *decompressor) (s synReplyFrame, err os.Error) {
 		if s.Header, err = c.Decompress(s.StreamId, s.Version, d[14:]); err != nil {
 			return s, err
 		}
-		s.Status = s.Header.Get("Status")
-		s.Proto = s.Header.Get("Version")
+		s.Status = popHeader(s.Header, "Status")
+		s.Proto = popHeader(s.Header, "Version")
 	case 3:
 		if s.Header, err = c.Decompress(s.StreamId, s.Version, d[12:]); err != nil {
 			return s, err
 		}
-		s.Status = s.Header.Get(":status")
-		s.Proto = s.Header.Get(":version")
+		s.Status = popHeader(s.Header, ":status")
+		s.Proto = popHeader(s.Header, ":version")
 	default:
 		return s, ErrStreamVersion{s.StreamId, s.Version}
 	}
@@ -542,11 +578,11 @@ func parseSynReply(d []byte, c *decompressor) (s synReplyFrame, err os.Error) {
 		return s, ErrStreamProtocol(s.StreamId)
 	}
 
-	if s.Header["Connection"] != nil ||
-		s.Header["Keep-Alive"] != nil ||
-		s.Header["Proxy-Connection"] != nil ||
-		s.Header["Transfer-Encoding"] != nil {
-		return s, ErrStreamProtocol(s.StreamId)
+	for _, key := range invalidSynReplyHeaders {
+		if s.Header[key] != nil {
+			log.Printf("spdy: invalid SYN_REPLY header %s: %s", key, s.Header.Get(key))
+			return s, ErrStreamProtocol(s.StreamId)
+		}
 	}
 
 	return s, nil
@@ -559,7 +595,7 @@ type headersFrame struct {
 	Header   http.Header
 }
 
-func (s *headersFrame) WriteTo(w io.Writer, c *compressor) os.Error {
+func (s *headersFrame) WritePacket(w io.Writer, c *compressor) os.Error {
 	log.Printf("spdy: tx HEADERS %+v", *s)
 
 	flags := uint32(0)
@@ -627,7 +663,7 @@ type rstStreamFrame struct {
 	Reason   int
 }
 
-func (s rstStreamFrame) WriteTo(w io.Writer, c *compressor) os.Error {
+func (s rstStreamFrame) WritePacket(w io.Writer, c *compressor) os.Error {
 	log.Printf("spdy: tx RST_STREAM %+v", s)
 	h := [16]byte{}
 	toBig32(h[0:], rstStreamCode|uint32(s.Version<<16))
@@ -665,7 +701,7 @@ type windowUpdateFrame struct {
 	WindowDelta int
 }
 
-func (s windowUpdateFrame) WriteTo(w io.Writer, c *compressor) os.Error {
+func (s windowUpdateFrame) WritePacket(w io.Writer, c *compressor) os.Error {
 	log.Printf("spdy: tx WINDOW_UPDATE %+v", s)
 	h := [16]byte{}
 	toBig32(h[0:], windowUpdateCode|uint32(s.Version<<16))
@@ -703,7 +739,7 @@ type settingsFrame struct {
 	Window     int
 }
 
-func (s settingsFrame) WriteTo(w io.Writer, c *compressor) os.Error {
+func (s settingsFrame) WritePacket(w io.Writer, c *compressor) os.Error {
 	if !s.HaveWindow {
 		return nil
 	}
@@ -789,7 +825,7 @@ type pingFrame struct {
 	Id      uint32
 }
 
-func (s pingFrame) WriteTo(w io.Writer, c *compressor) os.Error {
+func (s pingFrame) WritePacket(w io.Writer, c *compressor) os.Error {
 	log.Printf("spdy: tx PING %+v", s)
 	h := [12]byte{}
 	toBig32(h[0:], pingCode|uint32(s.Version<<16))
@@ -814,7 +850,7 @@ type goAwayFrame struct {
 	Reason       int
 }
 
-func (s goAwayFrame) WriteTo(w io.Writer, c *compressor) (err os.Error) {
+func (s goAwayFrame) WritePacket(w io.Writer, c *compressor) (err os.Error) {
 	log.Printf("spdy: tx GO_AWAY %+v", s)
 	h := [16]byte{}
 	toBig32(h[0:], goAwayCode|uint32(s.Version<<16))
@@ -871,7 +907,7 @@ type dataFrame struct {
 	Data       []byte
 }
 
-func (s dataFrame) WriteTo(w io.Writer, c *compressor) os.Error {
+func (s dataFrame) WritePacket(w io.Writer, c *compressor) os.Error {
 	log.Printf("spdy: tx DATA %+v %s", s, s.Data)
 
 	flags := uint32(0)

@@ -53,9 +53,16 @@ type Connection struct {
 // order. If it has to block it will flush the output buffer first.
 func (c *Connection) nextTxFrame(buf *bufio.Writer) (frame, chan os.Error) {
 	// try a non-blocking receive in priority order
+
+	// TODO(james): change back to a single select once go issue 2401 is
+	// resolved (this segfaults on arm)
 	select {
 	case f := <-c.sendControl:
 		return f, nil
+	default:
+	}
+
+	select {
 	case f := <-c.sendWindowUpdate:
 		return f, nil
 	default:
@@ -112,19 +119,11 @@ func (c *Connection) txPump() {
 			break
 		}
 
-		err := f.WriteTo(c.socket, &zip)
-		log.Printf("Written %T %v %v", f, finish, err)
-
+		err := f.WritePacket(c.socket, &zip)
 		if finish != nil {
 			finish <- err
 		}
-
-		if err != nil {
-			break
-		}
 	}
-
-	c.socket.Close()
 }
 
 // rxPump runs the connection receive loop for both client and server
@@ -369,6 +368,7 @@ func (c *Connection) handleStartRequest(s *stream) os.Error {
 		Header:             s.request.Header,
 		Priority:           s.txPriority,
 		URL:                s.request.URL,
+		Host:               s.request.Host,
 		Proto:              s.request.Proto,
 		Method:             s.request.Method,
 	}
@@ -470,7 +470,7 @@ func (c *Connection) handleSynStream(d []byte, unzip *decompressor) os.Error {
 		ProtoMajor: f.ProtoMajor,
 		ProtoMinor: f.ProtoMinor,
 		Header:     f.Header,
-		Host:       f.URL.Host,
+		Host:       f.Host,
 		RemoteAddr: c.remoteAddr.String(),
 		TLS:        c.tls,
 	}
@@ -479,7 +479,14 @@ func (c *Connection) handleSynStream(d []byte, unzip *decompressor) os.Error {
 		r.ContentLength = cl
 	}
 
-	s := c.newStream(r, f.Finished, f.Unidirectional, f.Priority)
+	extra := &RequestExtra{
+		Unidirectional:    f.Finished,
+		Priority:          f.Priority,
+		Compressed:        false,
+		AssociatedHandler: nil,
+	}
+
+	s := c.newStream(r, f.Unidirectional, extra)
 	s.streamId = f.StreamId
 	s.isRecipient = true
 	s.request.Body = (*streamRxUser)(s)

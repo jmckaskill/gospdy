@@ -2,77 +2,134 @@ package spdy
 
 import (
 	"bytes"
-	"os"
+	"fmt"
+	"http"
+	"reflect"
 	"testing"
 	"url"
 )
 
+func equal2(f, t reflect.Value) bool {
+	if f.Type() != t.Type() {
+		panic("different types")
+	}
+
+	switch f.Kind() {
+	case reflect.Array, reflect.Slice:
+		if f.Len() != t.Len() {
+			return false
+		}
+
+		for i := 0; i < f.Len(); i++ {
+			if !equal2(f.Index(i), t.Index(i)) {
+				return false
+			}
+		}
+
+	case reflect.String:
+		if f.String() != t.String() {
+			return false
+		}
+
+	case reflect.Struct:
+		for i := 0; i < f.NumField(); i++ {
+			if !equal2(t.Field(i), f.Field(i)) {
+				return false
+			}
+		}
+
+	case reflect.Map:
+		if f.Len() != t.Len() {
+			return false
+		}
+
+		for _, k := range f.MapKeys() {
+			if !equal2(f.MapIndex(k), t.MapIndex(k)) {
+				return false
+			}
+		}
+
+	case reflect.Bool:
+		if f.Bool() != t.Bool() {
+			return false
+		}
+
+	case reflect.Int:
+		if f.Int() != t.Int() {
+			return false
+		}
+
+	case reflect.Uint32:
+		if f.Uint() != t.Uint() {
+			return false
+		}
+
+	case reflect.Interface, reflect.Ptr:
+		if equal2(f.Elem(), t.Elem()) {
+			return false
+		}
+
+	default:
+		panic(fmt.Sprintf("not implemented %s", f.Kind()))
+	}
+
+	return true
+}
+
+func equal(f, t interface{}) bool {
+	return equal2(reflect.ValueOf(f), reflect.ValueOf(t))
+}
+
 func TestSynStreamFrame(t *testing.T) {
-	var err os.Error
 	buf := &bytes.Buffer{}
 	zip := &compressor{}
 	unzip := &decompressor{}
 
-	f := &synStreamFrame{
+	f := synStreamFrame{
 		Version:            2,
 		Finished:           true,
 		Unidirectional:     false,
 		StreamId:           2,
 		AssociatedStreamId: 0,
 		Header:             nil,
-		Priority:           4,
-		Proto:              "https",
+		Priority:           HighPriority,
+		Proto:              "HTTP/1.1",
 		Method:             "GET",
+		ProtoMajor:         1,
+		ProtoMinor:         1,
 	}
 
-	if f.URL, err = url.Parse("https://www.google.com/index.html"); err != nil {
-		t.Fatal(err)
+	f.URL, _ = url.Parse("https://www.google.com/index.html")
+
+	test := func() {
+		buf.Reset()
+		if err := f.WriteTo(buf, zip); err != nil {
+			t.Fatalf("%v %+v", err, f)
+		}
+
+		if f2, err := parseSynStream(buf.Bytes(), unzip); err != nil {
+			t.Fatalf("%v %+v", err, f)
+		} else if !equal(f, f2) {
+			t.Fatalf("%+v\n%+v", f, f2)
+		}
 	}
 
-	if err = f.WriteTo(buf, zip); err != nil && err != os.EOF {
-		t.Fatal("synStreamFrame.WriteTo", err)
-	}
+	f.Version = 2
+	test()
+	f.Version = 3
+	test()
 
-	t.Logf("SYN_STREAM %x", buf.Bytes())
+	f.Header = make(http.Header)
 
-	f2, err := parseSynStream(buf.Bytes(), unzip)
-	if err != nil {
-		t.Fatal("parseSynStream", err)
-	}
+	f.Version = 2
+	test()
+	f.Version = 3
+	test()
 
-	if f.Version != f2.Version {
-		t.Fatal("version mismatch")
-	}
+	f.Header.Add("WWW-Authentication", "foobar")
 
-	if f.Finished != f2.Finished {
-		t.Fatal("finished mismatch")
-	}
-
-	if f.Unidirectional != f2.Unidirectional {
-		t.Fatal("unidirectional mismatch")
-	}
-
-	if f.StreamId != f2.StreamId {
-		t.Fatal("stream id mismatch")
-	}
-
-	if f.AssociatedStreamId != f2.AssociatedStreamId {
-		t.Fatal("associated stream id mismatch")
-	}
-
-	if f.Priority != f2.Priority {
-		t.Fatal("priority mismatch")
-	}
-
-	if f.URL.String() != f2.URL.String() {
-		t.Fatal("url mismatch")
-	}
-
-	if f.Proto != f2.Proto {
-		t.Fatal("proto mismatch")
-	}
-
-	if f.Method != f2.Method {
-		t.Fatal("method mismatch")
-	}
+	f.Version = 2
+	test()
+	f.Version = 3
+	test()
 }

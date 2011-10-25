@@ -44,9 +44,8 @@ func (c *Connection) startRequest(parent *stream, req *http.Request, extra *Requ
 	body := req.Body
 	req.Body = nil
 
-	s := c.newStream(req, extra.Unidirectional, txFinished, extra.Priority)
+	s := c.newStream(req, txFinished, extra)
 	s.parent = parent
-	s.childHandler = extra.AssociatedHandler
 
 	// Send the SYN_REQUEST
 	select {

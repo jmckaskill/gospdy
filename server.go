@@ -152,7 +152,6 @@ func (s *httpsListener) Accept() (net.Conn, os.Error) {
 	case err := <-s.error:
 		return nil, err
 	case sock := <-s.accept:
-		log.Print(sock.RemoteAddr())
 		return &connLogger{sock, "https"}, nil
 	}
 	panic("unreachable")

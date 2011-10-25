@@ -1,13 +1,7 @@
 *.swp
+*.5
 *.6
-_obj
-/pkg
-_test
-_testmain.go
+*.8
+_*
 *.out
-/src/server/server
 .AppleDouble
-/bin
-/*.crt
-/*.key
-/src/client/client
