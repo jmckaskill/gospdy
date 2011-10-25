@@ -1,8 +1,15 @@
-.PHONY: all
+include $(GOROOT)/src/Make.inc
 
+TARG=spdy
+GOFILES=\
+	buffer.go \
+	client.go \
+	connection.go \
+	errors.go \
+	latency.go \
+	logging.go \
+	packets.go \
+	server.go \
+	stream.go
 
-all:
-	gofmt -w src/spdy/*.go src/server/*.go
-	govet src/spdy/*.go src/server/*.go
-	GOPATH="`pwd`" goinstall -nuke server
-	GOPATH="`pwd`" goinstall -nuke client
+include $(GOROOT)/src/Make.pkg
