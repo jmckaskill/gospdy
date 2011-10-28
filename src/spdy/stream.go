@@ -16,62 +16,63 @@ const (
 	defaultBufferSize = 64 * 1024
 	defaultWindow     = 64 * 1024
 	maxStreamId       = 0x7FFFFFFF
-)
-
-var (
-	ErrProtocolError          = os.NewError("spdy: protocol error")
-	ErrInvalidStream          = os.NewError("spdy: invalid stream")
-	ErrRefusedStream          = os.NewError("spdy: stream refused")
-	ErrUnsupportedVersion     = os.NewError("spdy: unsupported version")
-	ErrCancel                 = os.NewError("spdy: cancel")
-	ErrFlowControl            = os.NewError("spdy: flow control error")
-	ErrStreamInUse            = os.NewError("spdy: stream in use")
-	ErrStreamAlreadyClosed    = os.NewError("spdy: stream closed")
-	ErrAssociatedStreamClosed = os.NewError("spdy: associated stream closed")
-	ErrWriteAfterClose        = os.NewError("spdy: attempt to write to closed stream")
-	ErrParse                  = os.NewError("spdy: parse error")
-	ErrUnsupportedProxy       = os.NewError("spdy: unsupported proxy")
-	ErrGoAway                 = os.NewError("spdy: go away")
+	maxDataPacketSize = 4 * 1024
 )
 
 type stream struct {
-	streamId   int
-	connection *Connection
+	// Data setup when the stream is first created/registered and not
+	// changed thereafter
+	streamId    int
+	connection  *Connection
+	request     *http.Request
+	isRecipient bool
 
-	lock sync.Mutex
-	cond *sync.Cond // trigger when locked data is changed
-
-	// access is locked
-	response *http.Response
-	request  *http.Request
-
-	// access is locked, write from dispatch, read on stream rx
-	rxFinished   bool // frame with FLAG_FIN has been received
+	// Receive data, shared between dispatch and rx thread, data must be
+	// accessed with a lock and the condition variable is used to signal
+	// updates
+	rxLock       sync.Mutex
+	rxCond       *sync.Cond
+	rxResponse   *http.Response
 	rxBuffer     bytes.Buffer
-	rxReader     io.Reader
 	rxCompressed bool // whether the data is transparently compressed or not
-	rxData       bool // whether we've received any data
+	rxFinished   bool
+	rxError      os.Error
 
-	// access from stream tx thread
-	txClosed        bool // streamTxUser.Close has been called
-	txFinished      bool // frame with FLAG_FIN has been sent
-	txPriority      int
-	shouldSendReply bool // if SYN_REPLY still needs to be sent
-	headerWritten   bool // streamTxUser.WriteHeader has been called
-	replyHeader     http.Header
-	replyStatus     int
+	// Receive data only used by the dispatch thread
+	rxHaveData bool
 
-	txWindow     int // access is locked, session rx and stream tx threads
-	txWriter     flushWriteCloser
-	txCompressed bool
+	// Receive thread data, only accessed by the rx thread
+	rxClosed bool
+	rxReader io.Reader
 
-	closeError   os.Error // write access is locked
-	closeChannel chan bool
+	// Transmit data, shared between dispatch and tx thread
+	txLock   sync.Mutex
+	txCond   *sync.Cond
+	txWindow int
+	txError  os.Error
 
-	children []*stream // access is locked by streamLock
-	parent   *stream
+	// channel that is closed when txError is set to wake up the tx thread
+	// if it is blocked on sending to the connection send thread
+	txErrorChannel chan bool
 
-	handler http.Handler // handler for pushed associated streams where we are the requestor
+	// Transmit data, only accessed by the tx thread
+	txClosed           bool // streamTxUser.Close has been called
+	txPriority         int
+	txCompressed       bool
+	txBuffered         bool
+	txFinished         bool
+	txWriter           flushWriteCloser
+	replySent          bool
+	replyHeaderWritten bool
+	replyHeader        http.Header
+	replyStatus        int
+
+	// Data used by the dispatch thread for handling associated streams. A
+	// stream's associated stream (as specified in that streams
+	// SYN_STREAM) is its parent.
+	children     []*stream
+	parent       *stream
+	childHandler http.Handler
 }
 
 type flushWriteCloser interface {
@@ -79,10 +80,21 @@ type flushWriteCloser interface {
 	io.WriteCloser
 }
 
+type RequestExtra struct {
+	Unidirectional    bool
+	Priority          int
+	Compressed        bool
+	AssociatedHandler http.Handler
+}
+
 type Stream interface {
+	http.ResponseWriter
+	http.Flusher
 	SetPriority(priority int)
-	Priority(priority int)
+	Priority() int
 	EnableOutputCompression(compressed bool)
+	EnableOutputBuffering(buffering bool)
+	PushRequest(req *http.Request, extra *RequestExtra) (*http.Response, os.Error)
 }
 
 // Split the user accessible stream methods into seperate sets
@@ -90,12 +102,12 @@ type Stream interface {
 // Used as the txWriter output
 type streamTxOut stream
 
-// Given to the user when they can write as the ResponseWriter.
-// The user can then cast to a http.RoundTrip to push associated requests.
+// Given to the user when they can write as the ResponseWriter. The user can
+// then cast to a spdy.Stream to push associated requests, set the priority,
+// enable compression/buffering, etc.
 type streamTxUser stream
 
-var _ http.ResponseWriter = (*streamTxUser)(nil)
-var _ http.RoundTripper = (*streamTxUser)(nil)
+var _ Stream = (*streamTxUser)(nil)
 
 // Given to the user when the can read
 type streamRxUser stream
@@ -103,29 +115,54 @@ type streamRxUser stream
 // Seperate type so we can do transparent decompression
 type streamRxIn stream
 
-type closeableWriteBuffer struct {
-	*bufio.Writer
-}
+func (c *Connection) newStream(req *http.Request, rxFinished, txFinished bool, txPriority int) *stream {
+	s := new(stream)
+	s.connection = c
+	s.request = req
+	s.isRecipient = false
 
-func (s closeableWriteBuffer) Close() os.Error {
-	return s.Writer.Flush()
+	s.rxCond = sync.NewCond(&s.rxLock)
+	s.rxFinished = rxFinished
+	s.rxClosed = rxFinished
+
+	s.txCond = sync.NewCond(&s.txLock)
+	s.txWindow = defaultWindow
+
+	s.txErrorChannel = make(chan bool)
+
+	s.txClosed = txFinished
+	s.txFinished = txFinished
+	s.txPriority = txPriority
+	s.txBuffered = true
+	return s
 }
 
 func (s *streamRxIn) Read(buf []byte) (int, os.Error) {
-	s.lock.Lock()
-	defer s.lock.Unlock()
+	s.rxLock.Lock()
 
-	for !s.rxFinished && s.rxBuffer.Len() == 0 && s.closeError == nil {
-		s.cond.Wait()
+	for !s.rxFinished && s.rxBuffer.Len() == 0 && s.rxError == nil {
+		s.rxCond.Wait()
 	}
 
-	if s.closeError != nil {
-		return 0, s.closeError
+	if s.rxError != nil {
+		s.rxLock.Unlock()
+		return 0, s.rxError
 	}
 
-	// This returns os.EOF if we read with no data due to s.rxClosed ==
-	// true
-	return s.rxBuffer.Read(buf)
+	rxFinished := s.rxFinished
+	n, err := s.rxBuffer.Read(buf)
+	s.rxLock.Unlock()
+
+	c := s.connection
+	if !rxFinished && c.version >= 3 && n > 0 {
+		c.sendWindowUpdate <- windowUpdateFrame{
+			Version:     c.version,
+			StreamId:    s.streamId,
+			WindowDelta: n,
+		}
+	}
+
+	return n, err
 }
 
 // Read reads request/response data.
@@ -138,27 +175,21 @@ func (s *streamRxIn) Read(buf []byte) (int, os.Error) {
 // getting a SPDY RST_STREAM (equivalent of an abort).
 func (s *streamRxUser) Read(buf []byte) (n int, err os.Error) {
 	if s.rxReader == nil {
-		s.rxReader = (*streamRxIn)(s)
-
 		// Do a zero length read so we can wait for some data to
 		// arrive, so we can tell if its compressed or not.
-		if _, err := s.rxReader.Read([]byte{}); err != nil {
+		if _, err := (*streamRxIn)(s).Read([]byte{}); err != nil {
 			return 0, err
 		}
 
-		if s.rxFinished {
-			return 0, nil
-		}
-
-		if !s.rxData {
-			panic("spdy-internal: we should've received some data by now")
-		}
-
+		// Once we receive data, rxCompressed is not changed so its
+		// safe to read this without relocking rxLock.
 		if s.rxCompressed {
-			s.rxReader, err = zlib.NewReader(s.rxReader)
+			s.rxReader, err = zlib.NewReader((*streamRxIn)(s))
 			if err != nil {
 				return 0, err
 			}
+		} else {
+			s.rxReader = (*streamRxIn)(s)
 		}
 	}
 
@@ -166,13 +197,21 @@ func (s *streamRxUser) Read(buf []byte) (n int, err os.Error) {
 }
 
 // Closes the rx channel
-//
-// TODO(james): Currently we do nothing. Should we send a refused or cancel?
 func (s *streamRxUser) Close() os.Error {
-	return nil
+	// We don't care about recipients closing the request rx early
+	if s.isRecipient || s.rxClosed {
+		return nil
+	}
+
+	s.rxLock.Lock()
+	defer s.rxLock.Unlock()
+
+	s.rxClosed = true
+	s.connection.onStreamFinished <- (*stream)(s)
+	return s.rxError
 }
 
-// RoundTrip starts a new pushed request associated with this request.
+// PushRequest starts a new pushed request associated with this request.
 //
 // To change the priority of the request set the ":priority" header field to a
 // number between 0 (highest) and MaxPriority-1 (lowest). Otherwise
@@ -181,8 +220,8 @@ func (s *streamRxUser) Close() os.Error {
 // To start an unidirectional request where we do not wait for the response,
 // set the ":unidirectional" header to a non empty value. The return value
 // resp will then be nil.
-func (s *streamTxUser) RoundTrip(req *http.Request) (resp *http.Response, err os.Error) {
-	return s.connection.startRequest(req, (*stream)(s), nil)
+func (s *streamTxUser) PushRequest(req *http.Request, extra *RequestExtra) (resp *http.Response, err os.Error) {
+	return s.connection.startRequest((*stream)(s), req, extra)
 }
 
 // Header returns the response header so that headers can be changed.
@@ -203,11 +242,19 @@ func (s *streamTxUser) Header() http.Header {
 //
 // The Header() should not be changed after calling this.
 func (s *streamTxUser) WriteHeader(status int) {
-	if s.headerWritten {
-		panic("spdy: setting header after Write has been called")
+	if s.replyHeaderWritten {
+		panic("spdy: writing header twice")
 	}
-	s.headerWritten = true
+	s.replyHeaderWritten = true
 	s.replyStatus = status
+}
+
+func (s *streamTxUser) Priority() int {
+	return s.txPriority
+}
+
+func (s *streamTxUser) SetPriority(priority int) {
+	s.txPriority = priority
 }
 
 func (s *streamTxUser) EnableOutputCompression(compressed bool) {
@@ -220,11 +267,23 @@ func (s *streamTxUser) EnableOutputCompression(compressed bool) {
 		return
 	}
 
-	if s.headerWritten || s.txWriter != nil {
-		panic("spdy: setting header after Write has been called")
+	if s.replyHeaderWritten || s.txWriter != nil {
+		panic("spdy: changing output after Write has been called")
 	}
 
 	s.txCompressed = compressed
+}
+
+func (s *streamTxUser) EnableOutputBuffering(buffered bool) {
+	if s.txClosed {
+		return
+	}
+
+	if s.replyHeaderWritten || s.txWriter != nil {
+		panic("spdy: changing output after Write has been called")
+	}
+
+	s.txBuffered = buffered
 }
 
 // Write writes response body data.
@@ -245,62 +304,98 @@ func (s *streamTxUser) Write(data []byte) (n int, err os.Error) {
 		return 0, nil
 	}
 
-	if !s.headerWritten {
+	if !s.replyHeaderWritten {
 		s.WriteHeader(http.StatusOK)
 	}
 
 	if s.txWriter == nil {
+		out := (*streamTxOut)(s)
 		if s.txCompressed {
-			s.txWriter, err = zlib.NewWriter((*streamTxOut)(s))
+			buf := bufio.NewWriter(out)
+			zip, err := zlib.NewWriter(buf)
 			if err != nil {
 				return 0, err
 			}
+
+			s.txWriter = &flushingCompressor{zip, buf, s.txBuffered}
+
+		} else if s.txBuffered {
+			s.txWriter = closeableWriteBuffer{bufio.NewWriter(out)}
 		} else {
-			s.txWriter = closeableWriteBuffer{bufio.NewWriter((*streamTxOut)(s))}
+			s.txWriter = out
 		}
 	}
 
 	return s.txWriter.Write(data)
 }
 
-// Close closes the tx pipe and flushes any buffered data.
-func (s *streamTxUser) Close() os.Error {
+type flushingCompressor struct {
+	zip      *zlib.Writer
+	buf      *bufio.Writer
+	buffered bool
+}
+
+func (s *flushingCompressor) Write(p []byte) (int, os.Error) {
+	n, err := s.zip.Write(p)
+	if err != nil {
+		return n, err
+	}
+	if !s.buffered {
+		return n, s.Flush()
+	}
+	return n, err
+}
+
+func (s *flushingCompressor) Flush() os.Error {
+	s.zip.Flush()
+	return s.buf.Flush()
+}
+
+func (s *flushingCompressor) Close() os.Error {
+	s.zip.Close()
+	return s.buf.Flush()
+}
+
+type closeableWriteBuffer struct {
+	*bufio.Writer
+}
+
+func (s closeableWriteBuffer) Close() os.Error {
+	return s.Writer.Flush()
+}
+
+// CloseTx closes the tx pipe and flushes any buffered data. This is
+// called after the handler callback has finished and after pushing through
+// the request body.
+func (s *stream) closeTx() {
 	if s.txClosed {
-		return ErrWriteAfterClose
+		// This can happen if the tx is preclosed (eg a unidirectional
+		// reply)
+		return
 	}
 
-	// If we have written any data then we don't want the reply to say we
-	// are finished, but we want to be able to close the txWriter, instead
-	// of flushing it as zlib will produce different output using a flush
-	// vs a close.
+	s.txClosed = true
+	replySendFinished := s.txWriter == nil
+
+	if err := s.sendReplyIfNeeded(replySendFinished); err != nil {
+		// This can happen if the remote kills the stream before we
+		// send the reply, in which case we end up sending nothing
+		return
+	}
+
 	if s.txWriter != nil {
-		if s.shouldSendReply {
-			if err := (*streamTxOut)(s).sendReply(); err != nil {
-				return err
-			}
-		}
-
-		s.txClosed = true
-
 		if err := s.txWriter.Close(); err != nil {
-			return err
-		}
-	} else {
-		s.txClosed = true
-
-		if s.shouldSendReply {
-			if err := (*streamTxOut)(s).sendReply(); err != nil {
-				return err
-			}
+			return
 		}
 	}
 
 	// In most cases the close will have already been sent with the last
 	// of the data as it got flushed through, but in cases where no data
-	// was buffered (eg if it already been flushed or we never sent any)
-	// then we send an empty data frame with the finished flag here.
-	if !s.txFinished {
-		return nil
+	// was buffered (eg if it already been flushed, or buffuring was
+	// disabled) then we send an empty data frame with the finished flag
+	// here.
+	if s.txFinished {
+		return
 	}
 
 	f := dataFrame{
@@ -309,94 +404,112 @@ func (s *streamTxUser) Close() os.Error {
 		StreamId:   s.streamId,
 	}
 
-	if err := (*streamTxOut)(s).sendFrame(f); err != nil {
-		return err
-	}
-
+	s.sendFrame(f)
 	s.txFinished = true
-	s.connection.onFinishedSent <- (*stream)(s)
-	return nil
-
 }
 
 // Flush flushes data being written to the sessions tx thread which flushes it
 // out the socket.
-func (s *streamTxUser) Flush() os.Error {
-	if s.shouldSendReply {
-		if err := (*streamTxOut)(s).sendReply(); err != nil {
-			return err
-		}
+func (s *streamTxUser) Flush() {
+	if s.txClosed {
+		return
+	}
+
+	if err := (*stream)(s).sendReplyIfNeeded(false); err != nil {
+		return
 	}
 
 	if s.txWriter != nil {
 		if err := s.txWriter.Flush(); err != nil {
-			return err
+			return
 		}
 	}
-
-	return nil
 }
 
 // sendFrame sends a frame to the session tx thread, which sends it out the
 // socket.
-func (s *streamTxOut) sendFrame(f frame) os.Error {
-	select {
-	case <-s.closeChannel:
-		return s.closeError
-	case s.connection.sendData[s.txPriority] <- f:
+func (s *stream) sendFrame(f frame) os.Error {
+	c := s.connection
+
+	pri := s.txPriority - HighPriority
+	if pri < 0 {
+		pri = 0
+	} else if pri >= len(c.sendData) {
+		pri = len(c.sendData) - 1
 	}
 
-	return nil
+	select {
+	case <-s.txErrorChannel:
+		return s.txError
+	case c.sendData[pri] <- f:
+	}
+
+	return <-c.dataSent
 }
 
 // sendReply sends the SYN_REPLY frame which contains the response headers.
 // Note this won't be called until the first flush or the tx channel is closed.
-func (s *streamTxOut) sendReply() os.Error {
-	s.shouldSendReply = false
+func (s *stream) sendReplyIfNeeded(finished bool) os.Error {
+	if s.replySent || !s.isRecipient {
+		return nil
+	}
+
+	if !s.replyHeaderWritten {
+		(*streamTxUser)(s).WriteHeader(http.StatusOK)
+	}
 
 	f := &synReplyFrame{
 		Version:  s.connection.version,
-		Finished: s.txClosed,
+		Finished: finished,
 		StreamId: s.streamId,
 		Header:   s.replyHeader,
 		Status:   fmt.Sprintf("%d %s", s.replyStatus, http.StatusText(s.replyStatus)),
 		Proto:    "HTTP/1.1",
 	}
 
-	if err := s.sendFrame(f); err != nil {
-		return err
-	}
-
-	if f.Finished {
-		s.txFinished = true
-		s.connection.onFinishedSent <- (*stream)(s)
-	}
-
-	return nil
+	s.replySent = true
+	s.txFinished = finished
+	return s.sendFrame(f)
 }
 
 // amountOfDataToSend figures out how much data we can send, potentially
 // waiting for a WINDOW_UPDATE frame from the remote. It only returns once we
 // can send > 0 bytes or the remote sent a RST_STREAM to abort.
 func (s *streamTxOut) amountOfDataToSend(want int) (int, os.Error) {
-	s.lock.Lock()
-	defer s.lock.Unlock()
-
-	for s.txWindow <= 0 && s.closeError == nil {
-		s.cond.Wait()
+	if want > maxDataPacketSize {
+		want = maxDataPacketSize
 	}
 
-	if s.closeError != nil {
-		return 0, s.closeError
+	if s.connection.version < 3 {
+		return want, nil
 	}
 
-	tosend := want
-	if tosend < s.txWindow {
-		tosend = s.txWindow
+	s.txLock.Lock()
+	defer s.txLock.Unlock()
+
+	for s.txWindow <= 0 && s.txError == nil {
+		s.txCond.Wait()
 	}
 
-	s.txWindow -= tosend
-	return tosend, nil
+	if s.txError != nil {
+		return 0, s.txError
+	}
+
+	if want > s.txWindow {
+		want = s.txWindow
+	}
+
+	s.txWindow -= want
+	return want, nil
+}
+
+// Noops so we can disable buffering
+func (s *streamTxOut) Flush() os.Error {
+	return nil
+}
+
+func (s *streamTxOut) Close() os.Error {
+	return nil
 }
 
 // Function hooked up to the output of s.txWriter to flush data to the session
@@ -404,10 +517,8 @@ func (s *streamTxOut) amountOfDataToSend(want int) (int, os.Error) {
 func (s *streamTxOut) Write(data []byte) (int, os.Error) {
 	// If this is the first call and is due to the tx buffer filling up,
 	// then the reply hasn't yet been sent.
-	if s.shouldSendReply {
-		if err := s.sendReply(); err != nil {
-			return 0, err
-		}
+	if err := (*stream)(s).sendReplyIfNeeded(false); err != nil {
+		return 0, err
 	}
 
 	sent := 0
@@ -415,11 +526,9 @@ func (s *streamTxOut) Write(data []byte) (int, os.Error) {
 		var err os.Error
 		tosend := len(data) - sent
 
-		if s.connection.version >= 3 {
-			tosend, err = s.amountOfDataToSend(tosend)
-			if err != nil {
-				return sent, err
-			}
+		tosend, err = s.amountOfDataToSend(tosend)
+		if err != nil {
+			return sent, err
 		}
 
 		f := dataFrame{
@@ -429,13 +538,9 @@ func (s *streamTxOut) Write(data []byte) (int, os.Error) {
 			StreamId:   s.streamId,
 		}
 
-		if err := s.sendFrame(f); err != nil {
+		s.txFinished = f.Finished
+		if err := (*stream)(s).sendFrame(f); err != nil {
 			return sent, err
-		}
-
-		if f.Finished {
-			s.txFinished = true
-			s.connection.onFinishedSent <- (*stream)(s)
 		}
 
 		sent += tosend

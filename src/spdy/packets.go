@@ -3,7 +3,6 @@ package spdy
 import (
 	"bytes"
 	"compress/zlib"
-	"fmt"
 	"http"
 	"io"
 	"log"
@@ -13,8 +12,9 @@ import (
 )
 
 const (
-	MaxPriority     = 8
-	DefaultPriority = 4
+	LowPriority     = 3
+	HighPriority    = -4
+	DefaultPriority = 0
 
 	synStreamCode    = (1 << 31) | 1
 	synReplyCode     = (1 << 31) | 2
@@ -36,6 +36,7 @@ const (
 	headerDictionaryV3 = `optionsgetheadpostputdeletetraceacceptaccept-charsetaccept-encodingaccept-languageauthorizationexpectfromhostif-modified-sinceif-matchif-none-matchif-rangeif-unmodifiedsincemax-forwardsproxy-authorizationrangerefererteuser-agent100101200201202203204205206300301302303304305306307400401402403404405406407408409410411412413414415416417500501502503504505accept-rangesageetaglocationproxy-authenticatepublicretry-afterservervarywarningwww-authenticateallowcontent-basecontent-encodingcache-controlconnectiondatetrailertransfer-encodingupgradeviawarningcontent-languagecontent-lengthcontent-locationcontent-md5content-rangecontent-typeetagexpireslast-modifiedset-cookieMondayTuesdayWednesdayThursdayFridaySaturdaySundayJanFebMarAprMayJunJulAugSepOctNovDecchunkedtext/htmlimage/pngimage/jpgimage/gifapplication/xmlapplication/xhtmltext/plainpublicmax-agecharset=iso-8859-1utf-8gzipdeflateHTTP/1.1statusversionurl`
 	compressionLevel   = zlib.BestCompression
 
+	rstSuccess             = 0
 	rstProtocolError       = 1
 	rstInvalidStream       = 2
 	rstRefusedStream       = 3
@@ -92,7 +93,7 @@ type decompressor struct {
 	out io.ReadCloser
 }
 
-func (s *decompressor) Decompress(version int, data []byte) (headers http.Header, err os.Error) {
+func (s *decompressor) Decompress(streamId int, version int, data []byte) (headers http.Header, err os.Error) {
 
 	if s.in == nil {
 		s.in = bytes.NewBuffer(nil)
@@ -107,7 +108,7 @@ func (s *decompressor) Decompress(version int, data []byte) (headers http.Header
 		case 3:
 			s.out, err = zlib.NewReaderDict(s.in, []byte(headerDictionaryV3))
 		default:
-			err = ErrUnsupportedVersion
+			err = ErrStreamVersion{streamId, version}
 		}
 
 		if err != nil {
@@ -131,7 +132,7 @@ func (s *decompressor) Decompress(version int, data []byte) (headers http.Header
 		}
 		numkeys = int(fromBig32(h[:]))
 	default:
-		return nil, ErrUnsupportedVersion
+		return nil, ErrStreamVersion{streamId, version}
 	}
 
 	headers = make(http.Header)
@@ -154,11 +155,12 @@ func (s *decompressor) Decompress(version int, data []byte) (headers http.Header
 			}
 			klen = int(fromBig32(h[:]))
 		default:
-			return nil, ErrUnsupportedVersion
+			return nil, ErrStreamVersion{streamId, version}
 		}
 
 		if klen < 0 {
-			return nil, ErrParse
+			// TODO(james) new error as this isn't the whole packet data
+			return nil, ErrParse(data)
 		}
 
 		key := make([]byte, klen)
@@ -182,11 +184,12 @@ func (s *decompressor) Decompress(version int, data []byte) (headers http.Header
 			}
 			vlen = int(fromBig32(h[:]))
 		default:
-			return nil, ErrUnsupportedVersion
+			return nil, ErrStreamVersion{streamId, version}
 		}
 
 		if vlen < 0 {
-			return nil, ErrParse
+			// TODO(james) new error as this isn't the whole packet data
+			return nil, ErrParse(data)
 		}
 
 		val := make([]byte, vlen)
@@ -219,7 +222,7 @@ func (s *compressor) Begin(version int, init []byte, headers http.Header, numkey
 		case 3:
 			s.w, err = zlib.NewWriterDict(s.buf, compressionLevel, []byte(headerDictionaryV3))
 		default:
-			err = ErrUnsupportedVersion
+			err = ErrSessionVersion(version)
 		}
 
 		if err != nil {
@@ -278,7 +281,7 @@ func (s *compressor) Begin(version int, init []byte, headers http.Header, numkey
 			}
 		}
 	default:
-		return ErrUnsupportedVersion
+		return ErrSessionVersion(version)
 	}
 
 	return nil
@@ -325,6 +328,8 @@ type synStreamFrame struct {
 	Priority           int
 	URL                *url.URL
 	Proto              string
+	ProtoMajor         int
+	ProtoMinor         int
 	Method             string
 }
 
@@ -364,7 +369,7 @@ func (s *synStreamFrame) WriteTo(w io.Writer, c *compressor) os.Error {
 		c.CompressV3(":host", s.URL.Host)
 		c.CompressV3(":scheme", s.URL.Scheme)
 	default:
-		return ErrUnsupportedVersion
+		return ErrStreamVersion{s.StreamId, s.Version}
 	}
 
 	h := c.Finish()
@@ -374,7 +379,7 @@ func (s *synStreamFrame) WriteTo(w io.Writer, c *compressor) os.Error {
 	toBig32(h[12:], uint32(s.AssociatedStreamId))
 	// Priority is 2 bits in V2, this works correctly in that case because
 	// in V2 we don't use the bottom priority bit.
-	h[16] = byte(s.Priority << 5)
+	h[16] = byte((s.Priority - HighPriority) << 5)
 	h[17] = 0 // unused
 
 	_, err := w.Write(h)
@@ -382,21 +387,27 @@ func (s *synStreamFrame) WriteTo(w io.Writer, c *compressor) os.Error {
 }
 
 func parseSynStream(d []byte, c *decompressor) (s synStreamFrame, err os.Error) {
-	if len(d) < 18 {
-		return s, ErrParse
+	if len(d) < 12 {
+		return s, ErrParse(d)
 	}
+
+	s.StreamId = int(fromBig32(d[8:]))
+
+	if len(d) < 18 {
+		return s, ErrStreamProtocol(s.StreamId)
+	}
+
 	s.Version = int(fromBig16(d[0:]) & 0x7FFF)
 	s.Finished = (d[4] & finishedFlag) != 0
 	s.Unidirectional = (d[4] & unidirectionalFlag) != 0
-	s.StreamId = int(fromBig32(d[8:]))
 	s.AssociatedStreamId = int(fromBig32(d[12:]))
-	s.Priority = int(d[16] >> 5)
+	s.Priority = int(d[16]>>5) + HighPriority
 
 	if s.StreamId <= 0 || s.AssociatedStreamId < 0 {
-		return s, ErrParse
+		return s, ErrStreamProtocol(s.StreamId)
 	}
 
-	if s.Header, err = c.Decompress(s.Version, d[18:]); err != nil {
+	if s.Header, err = c.Decompress(s.StreamId, s.Version, d[18:]); err != nil {
 		return s, err
 	}
 
@@ -416,26 +427,41 @@ func parseSynStream(d []byte, c *decompressor) (s synStreamFrame, err os.Error) 
 		host = s.Header.Get(":host")
 		path = s.Header.Get(":path")
 	default:
-		return s, ErrUnsupportedVersion
+		return s, ErrStreamVersion{s.StreamId, s.Version}
 	}
 
-	s.URL, err = url.Parse(fmt.Sprintf("%s://%s%s", scheme, host, path))
+	var ok bool
+	if s.ProtoMajor, s.ProtoMinor, ok = http.ParseHTTPVersion(s.Proto); !ok {
+		return s, ErrStreamProtocol(s.StreamId)
+	}
+
+	s.URL, err = url.Parse(path)
 	if err != nil || len(path) == 0 || path[0] != '/' {
-		return s, err
+		return s, ErrStreamProtocol(s.StreamId)
 	}
+	s.URL.Scheme = scheme
+	s.URL.Host = host
 
-	// TODO(james): error on not allowed headers (eg Connection)
+	if s.Header["Connection"] != nil ||
+		s.Header["Keep-Alive"] != nil ||
+		s.Header["Proxy-Connection"] != nil ||
+		s.Header["Transfer-Encoding"] != nil {
+
+		return s, ErrStreamProtocol(s.StreamId)
+	}
 
 	return s, err
 }
 
 type synReplyFrame struct {
-	Version  int
-	Finished bool
-	StreamId int
-	Header   http.Header
-	Status   string
-	Proto    string
+	Version    int
+	Finished   bool
+	StreamId   int
+	Header     http.Header
+	Status     string
+	Proto      string
+	ProtoMajor int
+	ProtoMinor int
 }
 
 func (s *synReplyFrame) WriteTo(w io.Writer, c *compressor) os.Error {
@@ -462,7 +488,7 @@ func (s *synReplyFrame) WriteTo(w io.Writer, c *compressor) os.Error {
 		c.CompressV3(":status", s.Status)
 		c.CompressV3(":version", s.Proto)
 	default:
-		return ErrUnsupportedVersion
+		return ErrSessionVersion(s.Version)
 	}
 
 	h := c.Finish()
@@ -476,40 +502,52 @@ func (s *synReplyFrame) WriteTo(w io.Writer, c *compressor) os.Error {
 
 func parseSynReply(d []byte, c *decompressor) (s synReplyFrame, err os.Error) {
 	if len(d) < 12 {
-		return s, ErrParse
+		return s, ErrParse(d)
 	}
+
 	s.Version = int(fromBig16(d[0:]) & 0x7FFF)
 	s.Finished = (d[4] & finishedFlag) != 0
 	s.StreamId = int(fromBig32(d[8:]))
+
 	if s.StreamId < 0 {
-		return s, ErrParse
+		return s, ErrStreamProtocol(s.StreamId)
 	}
 
 	switch s.Version {
 	case 2:
 		if len(d) < 14 {
-			return s, ErrParse
+			return s, ErrStreamProtocol(s.StreamId)
 		}
-		if s.Header, err = c.Decompress(s.Version, d[14:]); err != nil {
+		if s.Header, err = c.Decompress(s.StreamId, s.Version, d[14:]); err != nil {
 			return s, err
 		}
 		s.Status = s.Header.Get("Status")
 		s.Proto = s.Header.Get("Version")
 	case 3:
-		if s.Header, err = c.Decompress(s.Version, d[12:]); err != nil {
+		if s.Header, err = c.Decompress(s.StreamId, s.Version, d[12:]); err != nil {
 			return s, err
 		}
 		s.Status = s.Header.Get(":status")
 		s.Proto = s.Header.Get(":version")
 	default:
-		return s, ErrUnsupportedVersion
+		return s, ErrStreamVersion{s.StreamId, s.Version}
 	}
 
 	if len(s.Status) == 0 || len(s.Proto) == 0 {
-		return s, ErrParse
+		return s, ErrStreamProtocol(s.StreamId)
 	}
 
-	// TODO(james): error on not allowed headers (eg Connection)
+	var ok bool
+	if s.ProtoMajor, s.ProtoMinor, ok = http.ParseHTTPVersion(s.Proto); !ok {
+		return s, ErrStreamProtocol(s.StreamId)
+	}
+
+	if s.Header["Connection"] != nil ||
+		s.Header["Keep-Alive"] != nil ||
+		s.Header["Proxy-Connection"] != nil ||
+		s.Header["Transfer-Encoding"] != nil {
+		return s, ErrStreamProtocol(s.StreamId)
+	}
 
 	return s, nil
 }
@@ -539,7 +577,7 @@ func (s *headersFrame) WriteTo(w io.Writer, c *compressor) os.Error {
 			return err
 		}
 	default:
-		return ErrUnsupportedVersion
+		return ErrSessionVersion(s.Version)
 	}
 
 	h := c.Finish()
@@ -553,30 +591,31 @@ func (s *headersFrame) WriteTo(w io.Writer, c *compressor) os.Error {
 
 func parseHeaders(d []byte, c *decompressor) (s headersFrame, err os.Error) {
 	if len(d) < 12 {
-		return s, ErrParse
+		return s, ErrParse(d)
 	}
 
 	s.Version = int(fromBig16(d) & 0x7FFF)
 	s.Finished = (d[4] & finishedFlag) != 0
 	s.StreamId = int(fromBig32(d[8:]))
+
 	if s.StreamId < 0 {
-		return s, ErrParse
+		return s, ErrStreamProtocol(s.StreamId)
 	}
 
 	switch s.Version {
 	case 2:
 		if len(d) < 16 {
-			return s, ErrParse
+			return s, ErrStreamProtocol(s.StreamId)
 		}
-		if s.Header, err = c.Decompress(s.Version, d[14:]); err != nil {
+		if s.Header, err = c.Decompress(s.StreamId, s.Version, d[14:]); err != nil {
 			return s, err
 		}
 	case 3:
-		if s.Header, err = c.Decompress(s.Version, d[12:]); err != nil {
+		if s.Header, err = c.Decompress(s.StreamId, s.Version, d[12:]); err != nil {
 			return s, err
 		}
 	default:
-		return s, ErrUnsupportedVersion
+		return s, ErrStreamVersion{s.StreamId, s.Version}
 	}
 
 	return s, nil
@@ -600,16 +639,21 @@ func (s rstStreamFrame) WriteTo(w io.Writer, c *compressor) os.Error {
 }
 
 func parseRstStream(d []byte) (s rstStreamFrame, err os.Error) {
+	if len(d) < 12 {
+		return s, ErrParse(d)
+	}
+
+	s.StreamId = int(fromBig32(d[8:]))
+
 	if len(d) < 16 {
-		return s, ErrParse
+		return s, ErrStreamProtocol(s.StreamId)
 	}
 
 	s.Version = int(fromBig16(d) & 0x7FFF)
-	s.StreamId = int(fromBig32(d[8:]))
 	s.Reason = int(fromBig32(d[12:]))
 
 	if s.StreamId < 0 || s.Reason == 0 {
-		return s, ErrParse
+		return s, ErrStreamProtocol(s.StreamId)
 	}
 
 	return s, nil
@@ -633,16 +677,21 @@ func (s windowUpdateFrame) WriteTo(w io.Writer, c *compressor) os.Error {
 }
 
 func parseWindowUpdate(d []byte) (s windowUpdateFrame, err os.Error) {
+	if len(d) < 12 {
+		return s, ErrParse(d)
+	}
+
+	s.StreamId = int(fromBig32(d[8:]))
+
 	if len(d) < 16 {
-		return s, ErrParse
+		return s, ErrStreamProtocol(s.StreamId)
 	}
 
 	s.Version = int(fromBig16(d) & 0x7FFF)
-	s.StreamId = int(fromBig32(d[8:]))
 	s.WindowDelta = int(fromBig32(d[12:]))
 
 	if s.StreamId < 0 || s.WindowDelta <= 0 {
-		return s, ErrParse
+		return s, ErrStreamProtocol(s.StreamId)
 	}
 
 	return s, nil
@@ -676,7 +725,7 @@ func (s settingsFrame) WriteTo(w io.Writer, c *compressor) os.Error {
 		toBig32(h[12:], windowSetting)
 		toBig32(h[16:], uint32(s.Window))
 	default:
-		return ErrUnsupportedVersion
+		return ErrSessionVersion(s.Version)
 	}
 
 	_, err := w.Write(h[:])
@@ -685,7 +734,7 @@ func (s settingsFrame) WriteTo(w io.Writer, c *compressor) os.Error {
 
 func parseSettings(d []byte) (s settingsFrame, err os.Error) {
 	if len(d) < 12 {
-		return s, ErrParse
+		return s, ErrParse(d)
 	}
 
 	s.Version = int(fromBig16(d) & 0x7FFF)
@@ -694,11 +743,11 @@ func parseSettings(d []byte) (s settingsFrame, err os.Error) {
 	// limit the number of entries to some max boundary to prevent a
 	// overflow when we calc the number of total bytes
 	if entries < 0 || entries > 4096 {
-		return s, ErrParse
+		return s, ErrParse(d)
 	}
 
 	if len(d)-12 < entries*8 {
-		return s, ErrParse
+		return s, ErrParse(d)
 	}
 
 	d = d[12:]
@@ -715,7 +764,7 @@ func parseSettings(d []byte) (s settingsFrame, err os.Error) {
 			key = int(fromBig32(d[0:]) & 0xFFFFFF)
 			val = int(fromBig32(d[4:]))
 		default:
-			return s, ErrUnsupportedVersion
+			return s, ErrSessionVersion(s.Version)
 		}
 
 		d = d[8:]
@@ -727,7 +776,7 @@ func parseSettings(d []byte) (s settingsFrame, err os.Error) {
 				s.Window *= 1024
 			}
 			if s.Window < 0 {
-				return s, ErrParse
+				return s, ErrSessionProtocol
 			}
 		}
 	}
@@ -752,7 +801,7 @@ func (s pingFrame) WriteTo(w io.Writer, c *compressor) os.Error {
 
 func parsePing(d []byte) (s pingFrame, err os.Error) {
 	if len(d) < 12 {
-		return s, ErrParse
+		return s, ErrParse(d)
 	}
 	s.Version = int(fromBig16(d) & 0x7FFF)
 	s.Id = fromBig32(d[8:])
@@ -780,7 +829,7 @@ func (s goAwayFrame) WriteTo(w io.Writer, c *compressor) (err os.Error) {
 	case 3:
 		_, err = w.Write(h[:])
 	default:
-		err = ErrUnsupportedVersion
+		err = ErrSessionVersion(s.Version)
 	}
 
 	return err
@@ -791,24 +840,25 @@ func parseGoAway(d []byte) (s goAwayFrame, err os.Error) {
 
 	switch s.Version {
 	case 2:
-		if len(d) < 8 {
-			return s, ErrParse
+		if len(d) < 12 {
+			return s, ErrParse(d)
 		}
 
 		s.LastStreamId = int(fromBig32(d[8:]))
+		s.Reason = rstSuccess
 	case 3:
 		if len(d) < 16 {
-			return s, ErrParse
+			return s, ErrParse(d)
 		}
 
 		s.LastStreamId = int(fromBig32(d[8:]))
 		s.Reason = int(fromBig32(d[12:]))
 	default:
-		return s, ErrUnsupportedVersion
+		return s, ErrSessionVersion(s.Version)
 	}
 
 	if s.LastStreamId < 0 {
-		return s, ErrParse
+		return s, ErrSessionProtocol
 	}
 
 	return s, nil
@@ -822,8 +872,7 @@ type dataFrame struct {
 }
 
 func (s dataFrame) WriteTo(w io.Writer, c *compressor) os.Error {
-	log.Printf("spdy: tx DATA {StreamId: %d Finished: %v Compressed: %v, Data: len %d}",
-		s.StreamId, s.Finished, s.Compressed, len(s.Data))
+	log.Printf("spdy: tx DATA %+v %s", s, s.Data)
 
 	flags := uint32(0)
 	if s.Finished {
@@ -854,7 +903,7 @@ func parseData(d []byte) (s dataFrame, err os.Error) {
 	s.Compressed = (d[4] & compressedFlag) != 0
 	s.Data = d[8:]
 	if s.StreamId < 0 {
-		return s, ErrParse
+		return s, ErrStreamProtocol(s.StreamId)
 	}
 	return s, nil
 }

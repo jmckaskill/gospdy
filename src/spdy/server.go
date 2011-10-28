@@ -137,41 +137,6 @@ func ListenAndServeTLS(addr string, certFile string, keyFile string, handler htt
 	return err
 }
 
-type connLogger struct {
-	net.Conn
-	prefix string
-}
-
-func (l *connLogger) Close() (err os.Error) {
-	err = l.Conn.Close()
-	if err != nil {
-		log.Printf("%s Close: %v", l.prefix, err)
-	} else {
-		log.Printf("%s Close", l.prefix)
-	}
-	return
-}
-
-func (l *connLogger) Read(p []byte) (n int, err os.Error) {
-	n, err = l.Conn.Read(p)
-	if err != nil {
-		log.Printf("%s Read %s: %v", l.prefix, p[0:n], err)
-	} else {
-		log.Printf("%s Read %s", l.prefix, p[0:n])
-	}
-	return
-}
-
-func (l *connLogger) Write(p []byte) (n int, err os.Error) {
-	n, err = l.Conn.Write(p)
-	if err != nil {
-		log.Printf("%s Write %s: %v", l.prefix, p[0:n], err)
-	} else {
-		log.Printf("%s Write %s", l.prefix, p[0:n])
-	}
-	return
-}
-
 // httpsListener is a fake listener for feeding to the standard HTTPS server.
 //
 // This is so that we can hand it connections which negotiate https as their

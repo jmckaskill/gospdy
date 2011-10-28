@@ -10,3 +10,4 @@ _testmain.go
 /bin
 /*.crt
 /*.key
+/src/client/client

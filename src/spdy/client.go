@@ -9,104 +9,82 @@ import (
 	"net"
 	"os"
 	"sync"
-	"strconv"
 	"strings"
 	"url"
 )
 
-var DefaultTransport http.RoundTripper = &Transport{Proxy: http.ProxyFromEnvironment}
+var DefaultTransport http.RoundTripper = &Transport{
+	Proxy:          http.ProxyFromEnvironment,
+	FallbackClient: http.DefaultClient,
+}
+
 var DefaultClient = &http.Client{Transport: DefaultTransport}
 
 // requestTxThread pushes the request body down the stream
-func requestTxThread(body io.ReadCloser, s *streamTxUser) {
-	io.Copy(s, body)
-	s.Close()
+func requestTxThread(body io.ReadCloser, s *stream, compressed bool) {
+	// io.Copy uses large Reads so buffering is not needed
+	tx := (*streamTxUser)(s)
+	tx.EnableOutputBuffering(false)
+	tx.EnableOutputCompression(compressed)
+	io.Copy(tx, body)
+	s.closeTx()
 	body.Close()
 }
 
+var DefaultExtra = &RequestExtra{}
+
 // startRequest starts a new request and starts pushing the request body and
 // waits for the reply (if non unidirectional).
-func (c *Connection) startRequest(req *http.Request, parentStream *stream, childHandler http.Handler) (resp *http.Response, err os.Error) {
-	priority := DefaultPriority
-	pstr := req.Header.Get(":priority")
-	if p, err := strconv.Atoi(pstr); len(pstr) > 0 && err != nil && 0 <= p && p < MaxPriority {
-		priority = p
+func (c *Connection) startRequest(parent *stream, req *http.Request, extra *RequestExtra) (resp *http.Response, err os.Error) {
+	if extra == nil {
+		extra = DefaultExtra
 	}
 
-	rxFinished := len(req.Header.Get(":unidirectional")) > 0
 	txFinished := req.Body == nil
-
 	body := req.Body
 	req.Body = nil
 
-	s := new(stream)
-	s.connection = c
-	s.cond = sync.NewCond(&s.lock)
-	s.request = req
-
-	s.rxFinished = rxFinished
-
-	s.txClosed = txFinished
-	s.txFinished = txFinished
-	s.txPriority = priority
-	s.shouldSendReply = false
-
-	s.txWindow = defaultWindow
-
-	s.closeChannel = make(chan bool)
-
-	s.parent = parentStream
-
-	s.handler = childHandler
+	s := c.newStream(req, extra.Unidirectional, txFinished, extra.Priority)
+	s.parent = parent
+	s.childHandler = extra.AssociatedHandler
 
 	// Send the SYN_REQUEST
 	select {
-	case <-c.goAwayChannel:
+	case <-c.onGoAway:
 		return nil, ErrGoAway
 	case c.onStartRequest <- s:
 	}
 
+	if err := <-c.onRequestStarted; err != nil {
+		return nil, err
+	}
+
 	// Start the request body push
 	if !txFinished {
-		go requestTxThread(body, (*streamTxUser)(s))
+		go requestTxThread(body, s, extra.Compressed)
 	}
 
 	// Wait for the reply
-	if rxFinished {
+	if extra.Unidirectional {
 		return nil, nil
 	}
 
-	s.lock.Lock()
-	defer s.lock.Unlock()
+	s.rxLock.Lock()
+	defer s.rxLock.Unlock()
 
-	for s.response == nil && s.closeError == nil {
-		s.cond.Wait()
+	for s.rxResponse == nil && s.rxError == nil {
+		s.rxCond.Wait()
 	}
 
-	return s.response, s.closeError
-}
-
-// RoundTrip starts a new request on the connection and then waits for the
-// response header.
-//
-// To change the priority of the request set the ":priority" header field to a
-// number between 0 (highest) and MaxPriority-1 (lowest). Otherwise
-// DefaultPriority will be used.
-//
-// To start an unidirectional request where we do not wait for the response,
-// set the ":unidirectional" header to a non empty value. The return value
-// resp will then be nil.
-//
-// This can be safely called from any thread.
-func (c *Connection) RoundTrip(req *http.Request) (resp *http.Response, err os.Error) {
-	return c.startRequest(req, nil, nil)
+	return s.rxResponse, s.rxError
 }
 
 type Transport struct {
 	Proxy           func(*http.Request) (*url.URL, os.Error)
 	Dial            func(net, addr string) (c net.Conn, err os.Error)
 	TLSClientConfig *tls.Config
-	FallbackClient  http.Client
+	FallbackClient  *http.Client
+	RequestExtra    *RequestExtra
 
 	lk          sync.Mutex
 	connections map[string]*Connection // key is proxy_url|host:port
@@ -146,13 +124,14 @@ func (t *Transport) dialProxy(proxy *url.URL, addr string) (net.Conn, os.Error) 
 	if dial == nil {
 		dial = net.Dial
 	}
+	addr = addDefaultPort(addr, 443)
 
 	if proxy == nil {
-		return dial("tcp", addDefaultPort(addr, 443))
+		return dial("tcp", addr)
 	}
 
 	if proxy.Scheme != "http" {
-		return nil, ErrUnsupportedProxy
+		return nil, ErrUnsupportedProxy(proxy.Scheme)
 	}
 
 	conn, err := dial("tcp", addDefaultPort(proxy.Host, 80))
@@ -162,8 +141,8 @@ func (t *Transport) dialProxy(proxy *url.URL, addr string) (net.Conn, os.Error) 
 
 	req := &http.Request{
 		Method: "CONNECT",
-		RawURL: addDefaultPort(addr, 443),
-		Host:   addDefaultPort(addr, 443),
+		URL:    &url.URL{RawPath: addr},
+		Host:   addr,
 		Header: make(http.Header),
 	}
 	// TODO(james): Proxy-Authentication
@@ -195,19 +174,24 @@ func (t *Transport) runClient(key string, c *Connection) {
 	c.Run()
 	t.lk.Lock()
 	if t.connections[key] == c {
-		t.connections[key] = nil, false
+		delete(t.connections, key)
 	}
 	t.lk.Unlock()
 }
 
 func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err os.Error) {
 	if req.URL == nil {
-		if req.URL, err = url.Parse(req.RawURL); err != nil {
-			return
-		}
+		return nil, os.NewError("http: nil Request.URL")
+	}
+	if req.Header == nil {
+		return nil, os.NewError("http: nil Request.Header")
 	}
 
 	if req.URL.Scheme != "https" {
+		if t.FallbackClient == nil {
+			return nil, os.NewError(fmt.Sprintf("spdy: no fallback client for scheme %s", req.URL.Scheme))
+		}
+
 		return t.FallbackClient.Do(req)
 	}
 
@@ -282,7 +266,7 @@ reconnect:
 	}
 
 	t.lk.Unlock()
-	resp, err = c.startRequest(req, nil, nil)
+	resp, err = c.startRequest(nil, req, t.RequestExtra)
 
 	// In the case that we missed the connection due to being told to go
 	// away, we need to reconnect. This is due to either the server
