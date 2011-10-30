@@ -119,7 +119,7 @@ func (c *Connection) txPump() {
 			break
 		}
 
-		err := f.WritePacket(c.socket, &zip)
+		err := f.WriteFrame(c.socket, &zip)
 		if finish != nil {
 			finish <- err
 		}
@@ -336,7 +336,7 @@ func (c *Connection) finishStream(s *stream, err os.Error) {
 }
 
 func (c *Connection) sendReset(streamId int, reason int) {
-	c.sendControl <- rstStreamFrame{
+	c.sendControl <- &rstStreamFrame{
 		Version:  c.version,
 		StreamId: streamId,
 		Reason:   reason,
@@ -368,7 +368,6 @@ func (c *Connection) handleStartRequest(s *stream) os.Error {
 		Header:             s.request.Header,
 		Priority:           s.txPriority,
 		URL:                s.request.URL,
-		Host:               s.request.Host,
 		Proto:              s.request.Proto,
 		Method:             s.request.Method,
 	}
@@ -470,7 +469,7 @@ func (c *Connection) handleSynStream(d []byte, unzip *decompressor) os.Error {
 		ProtoMajor: f.ProtoMajor,
 		ProtoMinor: f.ProtoMinor,
 		Header:     f.Header,
-		Host:       f.Host,
+		Host:       f.URL.Host,
 		RemoteAddr: c.remoteAddr.String(),
 		TLS:        c.tls,
 	}
@@ -699,7 +698,7 @@ func (c *Connection) handlePing(d []byte) os.Error {
 
 	// Ignore loopback pings
 	if (f.Id & 1) != (c.nextPingId & 1) {
-		c.sendControl <- pingFrame{
+		c.sendControl <- &pingFrame{
 			Version: c.version,
 			Id:      f.Id,
 		}

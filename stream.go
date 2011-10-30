@@ -158,8 +158,9 @@ func (s *streamRxIn) Read(buf []byte) (int, os.Error) {
 	s.rxLock.Unlock()
 
 	c := s.connection
+	// TODO(james) reduce how often we are sending window updates
 	if !rxFinished && c.version >= 3 && n > 0 {
-		c.sendWindowUpdate <- windowUpdateFrame{
+		c.sendWindowUpdate <- &windowUpdateFrame{
 			Version:     c.version,
 			StreamId:    s.streamId,
 			WindowDelta: n,
@@ -247,6 +248,10 @@ func (s *streamTxUser) WriteHeader(status int) {
 	}
 	s.replyHeaderWritten = true
 	s.replyStatus = status
+	if !s.txBuffered {
+		// TODO(james): what to do with an error?
+		_ = (*stream)(s).sendReplyIfNeeded(false)
+	}
 }
 
 func (s *streamTxUser) Priority() int {
@@ -398,7 +403,7 @@ func (s *stream) closeTx() {
 		return
 	}
 
-	f := dataFrame{
+	f := &dataFrame{
 		Finished:   true,
 		Compressed: s.txCompressed,
 		StreamId:   s.streamId,
@@ -531,7 +536,7 @@ func (s *streamTxOut) Write(data []byte) (int, os.Error) {
 			return sent, err
 		}
 
-		f := dataFrame{
+		f := &dataFrame{
 			Finished:   s.txClosed && sent+tosend == len(data),
 			Compressed: s.txCompressed,
 			Data:       data[sent : sent+tosend],

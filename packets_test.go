@@ -2,134 +2,151 @@ package spdy
 
 import (
 	"bytes"
-	"fmt"
 	"http"
+	"os"
 	"reflect"
 	"testing"
 	"url"
 )
 
-func equal2(f, t reflect.Value) bool {
-	if f.Type() != t.Type() {
-		panic("different types")
-	}
-
-	switch f.Kind() {
-	case reflect.Array, reflect.Slice:
-		if f.Len() != t.Len() {
-			return false
-		}
-
-		for i := 0; i < f.Len(); i++ {
-			if !equal2(f.Index(i), t.Index(i)) {
-				return false
-			}
-		}
-
-	case reflect.String:
-		if f.String() != t.String() {
-			return false
-		}
-
-	case reflect.Struct:
-		for i := 0; i < f.NumField(); i++ {
-			if !equal2(t.Field(i), f.Field(i)) {
-				return false
-			}
-		}
-
-	case reflect.Map:
-		if f.Len() != t.Len() {
-			return false
-		}
-
-		for _, k := range f.MapKeys() {
-			if !equal2(f.MapIndex(k), t.MapIndex(k)) {
-				return false
-			}
-		}
-
-	case reflect.Bool:
-		if f.Bool() != t.Bool() {
-			return false
-		}
-
-	case reflect.Int:
-		if f.Int() != t.Int() {
-			return false
-		}
-
-	case reflect.Uint32:
-		if f.Uint() != t.Uint() {
-			return false
-		}
-
-	case reflect.Interface, reflect.Ptr:
-		if equal2(f.Elem(), t.Elem()) {
-			return false
-		}
-
-	default:
-		panic(fmt.Sprintf("not implemented %s", f.Kind()))
-	}
-
-	return true
+type tester struct {
+	t     *testing.T
+	data  []byte
+	buf   bytes.Buffer
+	zip   compressor
+	unzip decompressor
 }
 
-func equal(f, t interface{}) bool {
-	return equal2(reflect.ValueOf(f), reflect.ValueOf(t))
+func newTester(t *testing.T) *tester {
+	return &tester{t: t}
+}
+
+func (s *tester) test(f frame, parse func() (frame, os.Error)) {
+	s.buf.Reset()
+	if err := f.WriteFrame(&s.buf, &s.zip); err != nil {
+		s.t.Fatalf("%v %+v", err, f)
+	}
+
+	s.data = s.buf.Bytes()
+	f2, err := parse()
+
+	if err != nil {
+		s.t.Fatalf("%v %+v", err, f)
+	}
+
+	if !reflect.DeepEqual(f, f2) {
+		s.t.Fatalf("%#v\n%#v", f, f2)
+	}
+}
+
+var testurl, _ = url.Parse("https://www.example.com/foo?bar=3")
+
+var requests = []synStreamFrame{
+	{
+		Finished:           true,
+		Unidirectional:     true,
+		StreamId:           3,
+		AssociatedStreamId: 2,
+		URL:                testurl,
+		Proto:              "HTTP/1.1",
+		ProtoMajor:         1,
+		ProtoMinor:         1,
+		Method:             "GET",
+	},
+	{
+		Finished:       false,
+		Unidirectional: false,
+		URL:            testurl,
+		Proto:          "HTTP/1.1",
+		ProtoMajor:     1,
+		ProtoMinor:     1,
+	},
+}
+
+var replies = []synReplyFrame{
+	{
+		Finished:   true,
+		StreamId:   50,
+		Status:     "202 OK",
+		Proto:      "HTTP/1.1",
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Header:     nil,
+	},
+	{
+		StreamId:   50,
+		Status:     "202 OK",
+		Proto:      "HTTP/1.1",
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Header: http.Header{
+			"Foo":  {"bar", "bar3"},
+			"Foo2": {"bar5", "bar6"},
+		},
+	},
+}
+
+var headers = []headersFrame{
+	{
+		Finished: true,
+		StreamId: 3,
+		Header:   nil,
+	},
+	{
+		Finished: false,
+		StreamId: 5,
+		Header:   http.Header{},
+	},
+	{
+		Finished: false,
+		StreamId: 7,
+		Header: http.Header{
+			"Foo": {"bar", "bar2"},
+		},
+	},
 }
 
 func TestSynStreamFrame(t *testing.T) {
-	buf := &bytes.Buffer{}
-	zip := &compressor{}
-	unzip := &decompressor{}
+	s := newTester(t)
+	for _, f := range requests {
+		f.Version = 2
+		s.test(&f, func() (frame, os.Error) {
+			return parseSynStream(s.data, &s.unzip)
+		})
 
-	f := synStreamFrame{
-		Version:            2,
-		Finished:           true,
-		Unidirectional:     false,
-		StreamId:           2,
-		AssociatedStreamId: 0,
-		Header:             nil,
-		Priority:           HighPriority,
-		Proto:              "HTTP/1.1",
-		Method:             "GET",
-		ProtoMajor:         1,
-		ProtoMinor:         1,
+		f.Version = 3
+		s.test(&f, func() (frame, os.Error) {
+			return parseSynStream(s.data, &s.unzip)
+		})
 	}
+}
 
-	f.URL, _ = url.Parse("https://www.google.com/index.html")
+func TestSynReplyFrame(t *testing.T) {
+	s := newTester(t)
+	for _, f := range replies {
+		f.Version = 2
+		s.test(&f, func() (frame, os.Error) {
+			return parseSynReply(s.data, &s.unzip)
+		})
 
-	test := func() {
-		buf.Reset()
-		if err := f.WriteTo(buf, zip); err != nil {
-			t.Fatalf("%v %+v", err, f)
-		}
-
-		if f2, err := parseSynStream(buf.Bytes(), unzip); err != nil {
-			t.Fatalf("%v %+v", err, f)
-		} else if !equal(f, f2) {
-			t.Fatalf("%+v\n%+v", f, f2)
-		}
+		f.Version = 3
+		s.test(&f, func() (frame, os.Error) {
+			return parseSynReply(s.data, &s.unzip)
+		})
 	}
+}
 
-	f.Version = 2
-	test()
-	f.Version = 3
-	test()
+func TestHeadersFrame(t *testing.T) {
+	s := newTester(t)
+	for _, f := range headers {
+		f.Version = 2
+		s.test(&f, func() (frame, os.Error) {
+			return parseHeaders(s.data, &s.unzip)
+		})
 
-	f.Header = make(http.Header)
-
-	f.Version = 2
-	test()
-	f.Version = 3
-	test()
-
-	f.Header.Add("WWW-Authentication", "foobar")
-
-	f.Version = 2
-	test()
-	f.Version = 3
-	test()
+		f.Version = 3
+		s.test(&f, func() (frame, os.Error) {
+			return parseHeaders(s.data, &s.unzip)
+		})
+	}
 }
