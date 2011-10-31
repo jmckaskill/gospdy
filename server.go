@@ -74,7 +74,7 @@ func serve(listener net.Listener, handler http.Handler, fallback chan net.Conn) 
 			return err
 		}
 
-		log.Printf("spdy: accept %s", sock.RemoteAddr())
+		Log("spdy: accept %s", sock.RemoteAddr())
 
 		// Do the TLS negotation on a seperate thread to avoid
 		// blocking the accept loop
@@ -152,7 +152,7 @@ func (s *httpsListener) Accept() (net.Conn, os.Error) {
 	case err := <-s.error:
 		return nil, err
 	case sock := <-s.accept:
-		return &connLogger{sock, "https"}, nil
+		return sock, nil
 	}
 	panic("unreachable")
 }

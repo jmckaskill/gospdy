@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"http"
 	"io"
-	"log"
 	"os"
 	"strings"
 	"url"
@@ -348,7 +347,7 @@ var invalidSynStreamHeaders = []string{
 }
 
 func (s *synStreamFrame) WriteFrame(w io.Writer, c *compressor) os.Error {
-	log.Printf("spdy: tx SYN_STREAM %+v", *s)
+	Log("spdy: tx SYN_STREAM %+v", *s)
 
 	flags := uint32(0)
 	if s.Finished {
@@ -406,17 +405,17 @@ func (s *synStreamFrame) WriteFrame(w io.Writer, c *compressor) os.Error {
 
 func parseSynStream(d []byte, c *decompressor) (*synStreamFrame, os.Error) {
 	if len(d) < 12 {
-		log.Print("spdy: invalid SYN_STREAM length")
+		Log("spdy: invalid SYN_STREAM length")
 		return nil, ErrParse(d)
 	}
 
 	sid := int(fromBig32(d[8:]))
 
 	if len(d) < 18 {
-		log.Print("spdy: invalid SYN_STREAM length")
+		Log("spdy: invalid SYN_STREAM length")
 		return nil, ErrStreamProtocol(sid)
 	} else if sid < 0 {
-		log.Print("spdy: invalid stream id")
+		Log("spdy: invalid stream id")
 		return nil, ErrStreamProtocol(sid)
 	}
 
@@ -430,13 +429,13 @@ func parseSynStream(d []byte, c *decompressor) (*synStreamFrame, os.Error) {
 	}
 
 	if s.AssociatedStreamId < 0 {
-		log.Print("spdy: invalid associated stream id")
+		Log("spdy: invalid associated stream id")
 		return nil, ErrStreamProtocol(sid)
 	}
 
 	var err os.Error
 	if s.Header, err = c.Decompress(s.StreamId, s.Version, d[18:]); err != nil {
-		log.Printf("spdy: SYN_STREAM decompress error: %v", err)
+		Log("spdy: SYN_STREAM decompress error: %v", err)
 		return nil, err
 	}
 
@@ -456,25 +455,25 @@ func parseSynStream(d []byte, c *decompressor) (*synStreamFrame, os.Error) {
 		host = popHeader(s.Header, ":host")
 		path = popHeader(s.Header, ":path")
 	default:
-		log.Printf("spdy: SYN_STREAM unsupported version %d", s.Version)
+		Log("spdy: SYN_STREAM unsupported version %d", s.Version)
 		return nil, ErrStreamVersion{sid, s.Version}
 	}
 
 	var ok bool
 	if s.ProtoMajor, s.ProtoMinor, ok = http.ParseHTTPVersion(s.Proto); !ok {
-		log.Printf("spdy: SYN_STREAM could not parse http version %s", s.Proto)
+		Log("spdy: SYN_STREAM could not parse http version %s", s.Proto)
 		return nil, ErrStreamProtocol(sid)
 	}
 
 	s.URL, err = url.Parse(fmt.Sprintf("%s://%s%s", scheme, host, path))
 	if err != nil || strings.Index(scheme, ":") >= 0 || strings.Index(host, "/") >= 0 || len(path) == 0 || path[0] != '/' {
-		log.Printf("spdy: invalid SYN_STREAM url %s://%s%s: %v", scheme, host, path, err)
+		Log("spdy: invalid SYN_STREAM url %s://%s%s: %v", scheme, host, path, err)
 		return nil, ErrStreamProtocol(sid)
 	}
 
 	for _, key := range invalidSynStreamHeaders {
 		if s.Header[key] != nil {
-			log.Printf("spdy: invalid SYN_STREAM header %s: %s", key, s.Header.Get(key))
+			Log("spdy: invalid SYN_STREAM header %s: %s", key, s.Header.Get(key))
 			return nil, ErrStreamProtocol(sid)
 		}
 	}
@@ -501,7 +500,7 @@ var invalidSynReplyHeaders = []string{
 }
 
 func (s *synReplyFrame) WriteFrame(w io.Writer, c *compressor) os.Error {
-	log.Printf("spdy: tx SYN_REPLY %+v", *s)
+	Log("spdy: tx SYN_REPLY %+v", *s)
 
 	flags := uint32(0)
 	if s.Finished {
@@ -589,7 +588,7 @@ func parseSynReply(d []byte, c *decompressor) (*synReplyFrame, os.Error) {
 
 	for _, key := range invalidSynReplyHeaders {
 		if s.Header[key] != nil {
-			log.Printf("spdy: invalid SYN_REPLY header %s: %s", key, s.Header.Get(key))
+			Log("spdy: invalid SYN_REPLY header %s: %s", key, s.Header.Get(key))
 			return nil, ErrStreamProtocol(s.StreamId)
 		}
 	}
@@ -605,7 +604,7 @@ type headersFrame struct {
 }
 
 func (s *headersFrame) WriteFrame(w io.Writer, c *compressor) os.Error {
-	log.Printf("spdy: tx HEADERS %+v", *s)
+	Log("spdy: tx HEADERS %+v", *s)
 
 	flags := uint32(0)
 	if s.Finished {
@@ -676,7 +675,7 @@ type rstStreamFrame struct {
 }
 
 func (s *rstStreamFrame) WriteFrame(w io.Writer, c *compressor) os.Error {
-	log.Printf("spdy: tx RST_STREAM %+v", s)
+	Log("spdy: tx RST_STREAM %+v", s)
 	h := [16]byte{}
 	toBig32(h[0:], rstStreamCode|uint32(s.Version<<16))
 	toBig32(h[4:], 8) // length and no flags
@@ -717,7 +716,7 @@ type windowUpdateFrame struct {
 }
 
 func (s *windowUpdateFrame) WriteFrame(w io.Writer, c *compressor) os.Error {
-	log.Printf("spdy: tx WINDOW_UPDATE %+v", s)
+	Log("spdy: tx WINDOW_UPDATE %+v", s)
 	h := [16]byte{}
 	toBig32(h[0:], windowUpdateCode|uint32(s.Version<<16))
 	toBig32(h[4:], 8) // length and no flags
@@ -761,7 +760,7 @@ func (s *settingsFrame) WriteFrame(w io.Writer, c *compressor) os.Error {
 	if !s.HaveWindow {
 		return nil
 	}
-	log.Printf("spdy: tx SETTINGS %+v", s)
+	Log("spdy: tx SETTINGS %+v", s)
 
 	h := [20]byte{}
 	toBig32(h[0:], settingsCode|uint32(s.Version<<16))
@@ -846,7 +845,7 @@ type pingFrame struct {
 }
 
 func (s *pingFrame) WriteFrame(w io.Writer, c *compressor) os.Error {
-	log.Printf("spdy: tx PING %+v", s)
+	Log("spdy: tx PING %+v", s)
 	h := [12]byte{}
 	toBig32(h[0:], pingCode|uint32(s.Version<<16))
 	toBig32(h[4:], 4) // length 4 and no flags
@@ -873,7 +872,7 @@ type goAwayFrame struct {
 }
 
 func (s *goAwayFrame) WriteFrame(w io.Writer, c *compressor) (err os.Error) {
-	log.Printf("spdy: tx GO_AWAY %+v", s)
+	Log("spdy: tx GO_AWAY %+v", s)
 	h := [16]byte{}
 	toBig32(h[0:], goAwayCode|uint32(s.Version<<16))
 	toBig32(h[4:], 8) // length 8 and no flags
@@ -927,7 +926,7 @@ type dataFrame struct {
 }
 
 func (s *dataFrame) WriteFrame(w io.Writer, c *compressor) os.Error {
-	log.Printf("spdy: tx DATA %+v %s", s, s.Data)
+	Log("spdy: tx DATA %+v %s", s, s.Data)
 
 	flags := uint32(0)
 	if s.Finished {

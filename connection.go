@@ -15,6 +15,8 @@ import (
 	"url"
 )
 
+var Log = func(fmt string, args ...interface{}) {}
+
 // data in connections are only accessible on the connection dispatch thread
 type Connection struct {
 	// general connection info
@@ -421,7 +423,7 @@ func (c *Connection) handleSynStream(d []byte, unzip *decompressor) os.Error {
 		return err
 	}
 
-	log.Printf("spdy: rx SYN_STREAM %+v", f)
+	Log("spdy: rx SYN_STREAM %+v", f)
 
 	// The remote has reopened an already opened stream. We kill both.
 	// Check this first as if any other check fails and this would've also
@@ -523,7 +525,7 @@ func (c *Connection) handleSynReply(d []byte, unzip *decompressor) os.Error {
 		return err
 	}
 
-	log.Printf("spdy: rx SYN_REPLY %+v", f)
+	Log("spdy: rx SYN_REPLY %+v", f)
 
 	s := c.streams[f.StreamId]
 	if s == nil {
@@ -580,7 +582,7 @@ func (c *Connection) handleHeaders(d []byte, unzip *decompressor) os.Error {
 		return err
 	}
 
-	log.Printf("spdy: rx HEADERS %+v", f)
+	Log("spdy: rx HEADERS %+v", f)
 
 	s := c.streams[f.StreamId]
 	if s == nil {
@@ -610,7 +612,7 @@ func (c *Connection) handleRstStream(d []byte) os.Error {
 		return err
 	}
 
-	log.Printf("spdy: rx RST_STREAM %+v", f)
+	Log("spdy: rx RST_STREAM %+v", f)
 
 	s := c.streams[f.StreamId]
 	if s == nil {
@@ -648,7 +650,7 @@ func (c *Connection) handleSettings(d []byte) os.Error {
 		return err
 	}
 
-	log.Printf("spdy: rx SETTINGS %+v", f)
+	Log("spdy: rx SETTINGS %+v", f)
 
 	if f.Version != c.version {
 		return ErrSessionVersion(f.Version)
@@ -677,7 +679,7 @@ func (c *Connection) handleWindowUpdate(d []byte) os.Error {
 		return err
 	}
 
-	log.Printf("spdy: rx WINDOW_UPDATE %+v", f)
+	Log("spdy: rx WINDOW_UPDATE %+v", f)
 
 	s := c.streams[f.StreamId]
 	if s == nil {
@@ -702,7 +704,7 @@ func (c *Connection) handlePing(d []byte) os.Error {
 		return err
 	}
 
-	log.Printf("spdy: rx PING %+v", f)
+	Log("spdy: rx PING %+v", f)
 
 	if f.Version != c.version {
 		return ErrSessionVersion(f.Version)
@@ -725,7 +727,7 @@ func (c *Connection) handleGoAway(d []byte) os.Error {
 		return err
 	}
 
-	log.Printf("spdy: rx GO_AWAY %+v", f)
+	Log("spdy: rx GO_AWAY %+v", f)
 
 	if f.Version != c.version {
 		return ErrSessionVersion(f.Version)
@@ -765,7 +767,7 @@ func (c *Connection) handleData(d []byte) os.Error {
 		return err
 	}
 
-	log.Printf("spdy: rx DATA %+v", f)
+	Log("spdy: rx DATA %+v", f)
 
 	s := c.streams[f.StreamId]
 	if s == nil {
