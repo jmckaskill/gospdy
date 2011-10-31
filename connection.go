@@ -12,6 +12,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"url"
 )
 
 // data in connections are only accessible on the connection dispatch thread
@@ -356,6 +357,17 @@ func (c *Connection) handleStartRequest(s *stream) os.Error {
 		return ErrGoAway
 	}
 
+	u := s.request.URL
+	if u.Scheme == "" || u.Host != s.request.Host {
+		u = new(url.URL)
+		*u = *s.request.URL
+		u.Host = s.request.Host
+
+		if u.Scheme == "" {
+			u.Scheme = "https"
+		}
+	}
+
 	// note we always use the control channel to ensure that the
 	// SYN_STREAM packets are sent out in the order in which the stream
 	// ids were allocated
@@ -367,7 +379,7 @@ func (c *Connection) handleStartRequest(s *stream) os.Error {
 		Unidirectional:     s.rxFinished,
 		Header:             s.request.Header,
 		Priority:           s.txPriority,
-		URL:                s.request.URL,
+		URL:                u,
 		Proto:              s.request.Proto,
 		Method:             s.request.Method,
 	}
