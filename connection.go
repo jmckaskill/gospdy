@@ -320,7 +320,7 @@ func (c *Connection) finishStream(s *stream, err os.Error) {
 	s.txCond.Broadcast()
 	s.txLock.Unlock()
 
-	close(s.txErrorChannel)
+	close(s.errorChannel)
 
 	// Remove ourself from our parent
 	if s.parent != nil {

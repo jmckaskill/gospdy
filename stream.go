@@ -51,9 +51,10 @@ type stream struct {
 	txWindow int
 	txError  os.Error
 
-	// channel that is closed when txError is set to wake up the tx thread
-	// if it is blocked on sending to the connection send thread
-	txErrorChannel chan bool
+	// channel that is closed when rxError and txError is set to wake up
+	// the rx and tx thread if it is blocked on sending to the connection
+	// send thread
+	errorChannel chan bool
 
 	// Transmit data, only accessed by the tx thread
 	txClosed           bool // streamTxUser.Close has been called
@@ -130,7 +131,7 @@ func (c *Connection) newStream(req *http.Request, txFinished bool, extra *Reques
 	s.txCond = sync.NewCond(&s.txLock)
 	s.txWindow = defaultWindow
 
-	s.txErrorChannel = make(chan bool)
+	s.errorChannel = make(chan bool)
 
 	s.txClosed = txFinished
 	s.txFinished = txFinished
@@ -158,12 +159,20 @@ func (s *streamRxIn) Read(buf []byte) (int, os.Error) {
 	s.rxLock.Unlock()
 
 	c := s.connection
+
 	// TODO(james) reduce how often we are sending window updates
 	if !rxFinished && c.version >= 3 && n > 0 {
-		c.sendWindowUpdate <- &windowUpdateFrame{
+		f := &windowUpdateFrame{
 			Version:     c.version,
 			StreamId:    s.streamId,
 			WindowDelta: n,
+		}
+
+		select {
+		case c.sendWindowUpdate <- f:
+		case <-s.errorChannel:
+			// Ignore the error this time around, it will be
+			// picked up on the next read
 		}
 	}
 
@@ -444,7 +453,7 @@ func (s *stream) sendFrame(f frame) os.Error {
 	}
 
 	select {
-	case <-s.txErrorChannel:
+	case <-s.errorChannel:
 		return s.txError
 	case c.sendData[pri] <- f:
 	}
