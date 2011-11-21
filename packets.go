@@ -158,7 +158,7 @@ func (s *decompressor) Decompress(streamId int, version int, data []byte) (heade
 			return nil, ErrStreamVersion{streamId, version}
 		}
 
-		if klen < 0 {
+		if klen < 0 || klen > defaultBufferSize {
 			// TODO(james) new error as this isn't the whole packet data
 			return nil, ErrParse(data)
 		}
@@ -187,7 +187,7 @@ func (s *decompressor) Decompress(streamId int, version int, data []byte) (heade
 			return nil, ErrStreamVersion{streamId, version}
 		}
 
-		if vlen < 0 {
+		if vlen < 0 || vlen > defaultBufferSize {
 			// TODO(james) new error as this isn't the whole packet data
 			return nil, ErrParse(data)
 		}
@@ -234,51 +234,40 @@ func (s *compressor) Begin(version int, init []byte, headers http.Header, numkey
 		s.buf.Write(init)
 	}
 
-	// count the number of extra headers
-	for key, _ := range headers {
-		if len(key) > 0 && key[0] != ':' {
-			numkeys++
-		}
-	}
-
 	switch version {
 	case 2:
 		var keys [2]byte
-		toBig16(keys[:], uint16(numkeys))
+		toBig16(keys[:], uint16(len(headers) + numkeys))
 		s.w.Write(keys[:])
 
 		for key, val := range headers {
-			if len(key) > 0 && key[0] != ':' {
-				var k, v [2]byte
-				vals := strings.Join(val, "\x00")
+			var k, v [2]byte
+			vals := strings.Join(val, "\x00")
 
-				toBig16(k[:], uint16(len(key)))
-				s.w.Write(k[:])
-				s.w.Write(bytes.ToLower([]byte(key)))
+			toBig16(k[:], uint16(len(key)))
+			s.w.Write(k[:])
+			s.w.Write(bytes.ToLower([]byte(key)))
 
-				toBig16(v[:], uint16(len(vals)))
-				s.w.Write(v[:])
-				s.w.Write([]byte(vals))
-			}
+			toBig16(v[:], uint16(len(vals)))
+			s.w.Write(v[:])
+			s.w.Write([]byte(vals))
 		}
 	case 3:
 		var keys [4]byte
-		toBig32(keys[:], uint32(numkeys))
+		toBig32(keys[:], uint32(len(headers) + numkeys))
 		s.w.Write(keys[:])
 
 		for key, val := range headers {
-			if len(key) > 0 && key[0] != ':' {
-				var k, v [4]byte
+			var k, v [4]byte
 
-				toBig32(k[:], uint32(len(key)))
-				s.w.Write(k[:])
-				s.w.Write(bytes.ToLower([]byte(key)))
+			toBig32(k[:], uint32(len(key)))
+			s.w.Write(k[:])
+			s.w.Write(bytes.ToLower([]byte(key)))
 
-				vals := strings.Join(val, "\x00")
-				toBig32(v[:], uint32(len(vals)))
-				s.w.Write(v[:])
-				s.w.Write([]byte(vals))
-			}
+			vals := strings.Join(val, "\x00")
+			toBig32(v[:], uint32(len(vals)))
+			s.w.Write(v[:])
+			s.w.Write([]byte(vals))
 		}
 	default:
 		return ErrSessionVersion(version)
