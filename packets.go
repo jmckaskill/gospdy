@@ -918,10 +918,9 @@ func parseGoAway(d []byte) (*goAwayFrame, error) {
 }
 
 type dataFrame struct {
-	StreamId   int
-	Finished   bool
-	Compressed bool
-	Data       []byte
+	StreamId int
+	Finished bool
+	Data     []byte
 }
 
 func (s *dataFrame) WriteFrame(w io.Writer, c *compressor) error {
@@ -930,9 +929,6 @@ func (s *dataFrame) WriteFrame(w io.Writer, c *compressor) error {
 	flags := uint32(0)
 	if s.Finished {
 		flags |= finishedFlag << 24
-	}
-	if s.Compressed {
-		flags |= compressedFlag << 24
 	}
 
 	h := [8]byte{}
@@ -952,10 +948,9 @@ func (s *dataFrame) WriteFrame(w io.Writer, c *compressor) error {
 
 func parseData(d []byte) (*dataFrame, error) {
 	s := &dataFrame{
-		StreamId:   int(fromBig32(d[0:])),
-		Finished:   (d[4] & finishedFlag) != 0,
-		Compressed: (d[4] & compressedFlag) != 0,
-		Data:       d[8:],
+		StreamId: int(fromBig32(d[0:])),
+		Finished: (d[4] & finishedFlag) != 0,
+		Data:     d[8:],
 	}
 
 	if s.StreamId < 0 {

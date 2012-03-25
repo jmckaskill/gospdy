@@ -21,14 +21,10 @@ var DefaultTransport http.RoundTripper = &Transport{
 
 var DefaultClient = &http.Client{Transport: DefaultTransport}
 
-// requestTxThread pushes the request body down the stream
-func requestTxThread(body io.ReadCloser, s *stream, compressed bool) {
-	// io.Copy uses large Reads so buffering is not needed
-	tx := (*streamTxUser)(s)
-	tx.EnableOutputBuffering(false)
-	tx.EnableOutputCompression(compressed)
-	io.Copy(tx, body)
-	s.closeTx()
+// sendRequestBody pushes the request body down the stream
+func sendRequestBody(body io.ReadCloser, s *streamTx) {
+	io.Copy(s, body)
+	s.close()
 	body.Close()
 }
 
@@ -59,9 +55,8 @@ func (c *Connection) startRequest(parent *stream, req *http.Request, extra *Requ
 		return nil, err
 	}
 
-	// Start the request body push
 	if !txFinished {
-		go requestTxThread(body, s, extra.Compressed)
+		go sendRequestBody(body, (*streamTx)(s))
 	}
 
 	// Wait for the reply

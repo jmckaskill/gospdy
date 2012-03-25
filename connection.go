@@ -56,15 +56,9 @@ type Connection struct {
 func (c *Connection) nextTxFrame(buf *bufio.Writer) (frame, chan error) {
 	// try a non-blocking receive in priority order
 
-	// TODO(james): change back to a single select once go issue 2401 is
-	// resolved (this segfaults on arm)
 	select {
 	case f := <-c.sendControl:
 		return f, nil
-	default:
-	}
-
-	select {
 	case f := <-c.sendWindowUpdate:
 		return f, nil
 	default:
@@ -129,8 +123,8 @@ func (c *Connection) txPump() {
 }
 
 // rxPump runs the connection receive loop for both client and server
-// connections. It then finds the message boundaries and sends each one over
-// to the connection thread.
+// connections. It finds the message boundaries and sends each one over to the
+// connection thread.
 func (c *Connection) rxPump(dispatch chan []byte, dispatched chan error, rxError chan error) {
 
 	buf := new(buffer)
@@ -266,9 +260,6 @@ func (c *Connection) Run() {
 	}
 }
 
-func (c *Connection) shutdown() {
-}
-
 /* finishStream removes a completed stream.
  *
  * It then shuts down the stream setting txError and rxError so the stream
@@ -345,6 +336,8 @@ func (c *Connection) sendReset(streamId int, reason int) {
 	}
 }
 
+/* handleStartRequest sends the SYN_STREAM and registers streams where we are
+* the initiator */
 func (c *Connection) handleStartRequest(s *stream) error {
 	s.streamId = c.nextStreamId
 	c.nextStreamId += 2
@@ -359,6 +352,9 @@ func (c *Connection) handleStartRequest(s *stream) error {
 	}
 
 	u := s.request.URL
+
+	// Fixup the url if we need to set the scheme and prefer the host in
+	// the request
 	if u.Scheme == "" || u.Host != s.request.Host {
 		u = new(url.URL)
 		*u = *s.request.URL
@@ -399,7 +395,7 @@ func (c *Connection) handleStartRequest(s *stream) error {
 	return nil
 }
 
-func handlerFinish(s *stream) {
+func handlerFinish(s *streamTx) {
 	if err := recover(); err != nil {
 		var buf bytes.Buffer
 		fmt.Fprintf(&buf, "spdy: panic serving %d: %v\n", s.streamId, err)
@@ -407,13 +403,13 @@ func handlerFinish(s *stream) {
 		log.Print(buf.String())
 	}
 
-	s.closeTx()
-	s.connection.onStreamFinished <- s
+	s.close()
+	s.connection.onStreamFinished <- (*stream)(s)
 }
 
-func handlerThread(h http.Handler, s *stream, req *http.Request) {
+func handlerThread(h http.Handler, s *streamTx, req *http.Request) {
 	defer handlerFinish(s)
-	h.ServeHTTP((*streamTxUser)(s), req)
+	h.ServeHTTP(s, req)
 }
 
 func (c *Connection) handleSynStream(d []byte, unzip *decompressor) error {
@@ -494,14 +490,13 @@ func (c *Connection) handleSynStream(d []byte, unzip *decompressor) error {
 	extra := &RequestExtra{
 		Unidirectional:    f.Finished,
 		Priority:          f.Priority,
-		Compressed:        false,
 		AssociatedHandler: nil,
 	}
 
 	s := c.newStream(r, f.Unidirectional, extra)
 	s.streamId = f.StreamId
 	s.isRecipient = true
-	s.request.Body = (*streamRxUser)(s)
+	s.request.Body = (*streamRx)(s)
 
 	// Messages that have both their rx and tx pipes already closed don't
 	// need to be added to the streams table.
@@ -514,7 +509,7 @@ func (c *Connection) handleSynStream(d []byte, unzip *decompressor) error {
 		}
 	}
 
-	go handlerThread(handler, s, r)
+	go handlerThread(handler, (*streamTx)(s), r)
 	return nil
 }
 
@@ -549,7 +544,7 @@ func (c *Connection) handleSynReply(d []byte, unzip *decompressor) error {
 		ProtoMajor: f.ProtoMajor,
 		ProtoMinor: f.ProtoMinor,
 		Header:     f.Header,
-		Body:       (*streamRxUser)(s),
+		Body:       (*streamRx)(s),
 		Request:    s.request,
 	}
 
@@ -783,16 +778,7 @@ func (c *Connection) handleData(d []byte) error {
 		return ErrStreamFlowControl(f.StreamId)
 	}
 
-	// Streams are not allowed to change from compress to non-compress mid
-	// way through
-	if s.rxHaveData && s.rxCompressed != f.Compressed {
-		return ErrStreamProtocol(f.StreamId)
-	}
-
-	s.rxHaveData = true
-
 	s.rxLock.Lock()
-	s.rxCompressed = f.Compressed
 	s.rxBuffer.Write(f.Data)
 	s.rxFinished = f.Finished
 	s.rxCond.Broadcast()
@@ -845,8 +831,8 @@ func (c *Connection) handleFrame(d []byte, unzip *decompressor) error {
 // NewConnection creates a SPDY client or server connection around sock.
 //
 // sock should be the underlying socket already connected. Typically this is a
-// TLS connection which has already gone the next protocol negotiation, but
-// any socket will work.
+// TLS connection which has already gone through next protocol negotiation,
+// but any socket will work.
 //
 // Handler is used to provide the callback for any content pushed from the
 // server. If it is nil then pushed streams are refused.

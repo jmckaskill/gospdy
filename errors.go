@@ -19,6 +19,7 @@ var (
 	ErrSessionFlowControl = errors.New("spdy: flow control error")
 	ErrSessionProtocol    = errors.New("sydy: protocol error")
 	ErrWriteAfterClose    = errors.New("spdy: write to closed stream")
+	ErrReadAfterClose     = errors.New("spdy: read to closed stream")
 )
 
 type ErrStreamProtocol int
