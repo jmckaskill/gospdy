@@ -15,33 +15,33 @@ type streamError interface {
 }
 
 var (
-	ErrGoAway             = errors.New("spdy: go away")
-	ErrSessionFlowControl = errors.New("spdy: flow control error")
-	ErrSessionProtocol    = errors.New("sydy: protocol error")
-	ErrWriteAfterClose    = errors.New("spdy: write to closed stream")
-	ErrReadAfterClose     = errors.New("spdy: read to closed stream")
+	errGoAway             = errors.New("spdy: go away")
+	errSessionFlowControl = errors.New("spdy: flow control error")
+	errSessionProtocol    = errors.New("sydy: protocol error")
+	errWriteAfterClose    = errors.New("spdy: write to closed stream")
+	errReadAfterClose     = errors.New("spdy: read to closed stream")
 )
 
-type ErrStreamProtocol int
-type ErrInvalidStream int
-type ErrRefusedStream int
-type ErrCancel int
-type ErrStreamFlowControl int
-type ErrStreamInUse int
-type ErrStreamAlreadyClosed int
-type ErrSessionVersion int
-type ErrParse []byte
-type ErrUnsupportedProxy string
-type ErrStreamVersion struct {
+type errStreamProtocol int
+type errInvalidStream int
+type errRefusedStream int
+type errCancel int
+type errStreamFlowControl int
+type errStreamInUse int
+type errStreamAlreadyClosed int
+type errSessionVersion int
+type errParse []byte
+type errUnsupportedProxy string
+type errStreamVersion struct {
 	streamId int
 	version  int
 }
-type ErrInvalidAssociatedStream struct {
+type errInvalidAssociatedStream struct {
 	streamId           int
 	associatedStreamId int
 }
 
-func (s ErrParse) Error() string {
+func (s errParse) Error() string {
 	data := []byte(s)
 	if len(data) > 20 {
 		return fmt.Sprintf("spdy: error parsing %X...", data[:20])
@@ -50,65 +50,65 @@ func (s ErrParse) Error() string {
 	return fmt.Sprintf("spdy: error parsing %X", data)
 }
 
-func (s ErrUnsupportedProxy) Error() string {
+func (s errUnsupportedProxy) Error() string {
 	return fmt.Sprintf("spdy: unsupported proxy %s", string(s))
 }
 
-func (s ErrSessionVersion) resetCode() int { return rstUnsupportedVersion }
-func (s ErrSessionVersion) Error() string {
+func (s errSessionVersion) resetCode() int { return rstUnsupportedVersion }
+func (s errSessionVersion) Error() string {
 	return fmt.Sprintf("spdy: unsupported version %d", int(s))
 }
 
-func (s ErrStreamVersion) StreamId() int  { return s.streamId }
-func (s ErrStreamVersion) resetCode() int { return rstUnsupportedVersion }
-func (s ErrStreamVersion) Error() string {
+func (s errStreamVersion) StreamId() int  { return s.streamId }
+func (s errStreamVersion) resetCode() int { return rstUnsupportedVersion }
+func (s errStreamVersion) Error() string {
 	return fmt.Sprintf("spdy: unsupported version %d in stream %d", s.version, s.streamId)
 }
 
-func (s ErrStreamProtocol) StreamId() int  { return int(s) }
-func (s ErrStreamProtocol) resetCode() int { return rstProtocolError }
-func (s ErrStreamProtocol) Error() string {
+func (s errStreamProtocol) StreamId() int  { return int(s) }
+func (s errStreamProtocol) resetCode() int { return rstProtocolError }
+func (s errStreamProtocol) Error() string {
 	return fmt.Sprintf("sydy: protocol error with stream %d", int(s))
 }
 
-func (s ErrInvalidStream) StreamId() int  { return int(s) }
-func (s ErrInvalidStream) resetCode() int { return rstInvalidStream }
-func (s ErrInvalidStream) Error() string {
+func (s errInvalidStream) StreamId() int  { return int(s) }
+func (s errInvalidStream) resetCode() int { return rstInvalidStream }
+func (s errInvalidStream) Error() string {
 	return fmt.Sprintf("spdy: stream %d does not exist", int(s))
 }
 
-func (s ErrInvalidAssociatedStream) StreamId() int  { return s.streamId }
-func (s ErrInvalidAssociatedStream) resetCode() int { return rstInvalidStream }
-func (s ErrInvalidAssociatedStream) Error() string {
+func (s errInvalidAssociatedStream) StreamId() int  { return s.streamId }
+func (s errInvalidAssociatedStream) resetCode() int { return rstInvalidStream }
+func (s errInvalidAssociatedStream) Error() string {
 	return fmt.Sprintf("spdy: associated stream %d does not exist whilst creating stream %d", s.associatedStreamId, s.streamId)
 }
 
-func (s ErrRefusedStream) StreamId() int  { return int(s) }
-func (s ErrRefusedStream) resetCode() int { return rstRefusedStream }
-func (s ErrRefusedStream) Error() string {
+func (s errRefusedStream) StreamId() int  { return int(s) }
+func (s errRefusedStream) resetCode() int { return rstRefusedStream }
+func (s errRefusedStream) Error() string {
 	return fmt.Sprintf("spdy: stream %d refused", int(s))
 }
 
-func (s ErrCancel) StreamId() int  { return int(s) }
-func (s ErrCancel) resetCode() int { return rstCancel }
-func (s ErrCancel) Error() string {
+func (s errCancel) StreamId() int  { return int(s) }
+func (s errCancel) resetCode() int { return rstCancel }
+func (s errCancel) Error() string {
 	return fmt.Sprintf("spdy: stream %d has been cancelled", int(s))
 }
 
-func (s ErrStreamFlowControl) StreamId() int  { return int(s) }
-func (s ErrStreamFlowControl) resetCode() int { return rstFlowControlError }
-func (s ErrStreamFlowControl) Error() string {
+func (s errStreamFlowControl) StreamId() int  { return int(s) }
+func (s errStreamFlowControl) resetCode() int { return rstFlowControlError }
+func (s errStreamFlowControl) Error() string {
 	return fmt.Sprintf("spdy: flow control error with stream %d", int(s))
 }
 
-func (s ErrStreamInUse) StreamId() int  { return int(s) }
-func (s ErrStreamInUse) resetCode() int { return rstStreamInUse }
-func (s ErrStreamInUse) Error() string {
+func (s errStreamInUse) StreamId() int  { return int(s) }
+func (s errStreamInUse) resetCode() int { return rstStreamInUse }
+func (s errStreamInUse) Error() string {
 	return fmt.Sprintf("spdy: stream id %d was already being used", int(s))
 }
 
-func (s ErrStreamAlreadyClosed) StreamId() int  { return int(s) }
-func (s ErrStreamAlreadyClosed) resetCode() int { return rstStreamAlreadyClosed }
-func (s ErrStreamAlreadyClosed) Error() string {
+func (s errStreamAlreadyClosed) StreamId() int  { return int(s) }
+func (s errStreamAlreadyClosed) resetCode() int { return rstStreamAlreadyClosed }
+func (s errStreamAlreadyClosed) Error() string {
 	return fmt.Sprintf("spdy: stream %d has already been closed", int(s))
 }

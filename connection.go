@@ -213,7 +213,7 @@ func (c *Connection) Run() {
 				c.sendReset(s.streamId, rstCancel)
 			}
 
-			c.finishStream(s, ErrCancel(s.streamId))
+			c.finishStream(s, errCancel(s.streamId))
 
 		case d := <-dispatch:
 			err := c.handleFrame(d, &unzip)
@@ -348,7 +348,7 @@ func (c *Connection) handleStartRequest(s *stream) error {
 	}
 
 	if uint(s.streamId) > maxStreamId || c.goAway {
-		return ErrGoAway
+		return errGoAway
 	}
 
 	u := s.request.URL
@@ -424,22 +424,22 @@ func (c *Connection) handleSynStream(d []byte, unzip *decompressor) error {
 	// Check this first as if any other check fails and this would've also
 	// failed sending out the reset will invalidate the existing stream.
 	if s2 := c.streams[f.StreamId]; s2 != nil {
-		return ErrStreamInUse(f.StreamId)
+		return errStreamInUse(f.StreamId)
 	}
 
 	if f.Version != c.version {
-		return ErrStreamVersion{f.StreamId, f.Version}
+		return errStreamVersion{f.StreamId, f.Version}
 	}
 
 	// The remote tried to open a stream of the wrong type (eg its a
 	// client and tried to open a server stream).
 	if (f.StreamId & 1) == (c.nextStreamId & 1) {
-		return ErrStreamProtocol(f.StreamId)
+		return errStreamProtocol(f.StreamId)
 	}
 
 	// Stream Ids must monotonically increase
 	if f.StreamId <= c.lastStreamOpened {
-		return ErrStreamProtocol(f.StreamId)
+		return errStreamProtocol(f.StreamId)
 	}
 	c.lastStreamOpened = f.StreamId
 
@@ -452,20 +452,20 @@ func (c *Connection) handleSynStream(d []byte, unzip *decompressor) error {
 		// You are only allowed to open associated streams to streams
 		// that you are the recipient.
 		if (f.AssociatedStreamId & 1) != (c.nextStreamId & 1) {
-			return ErrStreamProtocol(f.StreamId)
+			return errStreamProtocol(f.StreamId)
 		}
 		parent = c.streams[f.AssociatedStreamId]
 		// The remote tried to open a stream associated with a closed
 		// stream. We kill this new stream.
 		if parent == nil {
-			return ErrInvalidAssociatedStream{f.StreamId, f.AssociatedStreamId}
+			return errInvalidAssociatedStream{f.StreamId, f.AssociatedStreamId}
 		}
 
 		handler = parent.childHandler
 	}
 
 	if handler == nil {
-		return ErrRefusedStream(f.StreamId)
+		return errRefusedStream(f.StreamId)
 	}
 
 	// The SYN_STREAM passed all of our tests, so go ahead and create the
@@ -523,19 +523,19 @@ func (c *Connection) handleSynReply(d []byte, unzip *decompressor) error {
 
 	s := c.streams[f.StreamId]
 	if s == nil {
-		return ErrInvalidStream(f.StreamId)
+		return errInvalidStream(f.StreamId)
 	}
 
 	if f.Version != c.version {
-		return ErrStreamVersion{f.StreamId, f.Version}
+		return errStreamVersion{f.StreamId, f.Version}
 	}
 
 	if s.rxResponse != nil {
-		return ErrStreamInUse(f.StreamId)
+		return errStreamInUse(f.StreamId)
 	}
 
 	if s.rxFinished {
-		return ErrStreamAlreadyClosed(f.StreamId)
+		return errStreamAlreadyClosed(f.StreamId)
 	}
 
 	r := &http.Response{
@@ -550,11 +550,11 @@ func (c *Connection) handleSynReply(d []byte, unzip *decompressor) error {
 
 	split := strings.SplitN(f.Status, " ", 2)
 	if len(split) < 2 {
-		return ErrStreamProtocol(f.StreamId)
+		return errStreamProtocol(f.StreamId)
 	}
 
 	if r.StatusCode, err = strconv.Atoi(split[0]); err != nil {
-		return ErrStreamProtocol(f.StreamId)
+		return errStreamProtocol(f.StreamId)
 	}
 
 	if cl, err := strconv.ParseInt(f.Header.Get("Content-Length"), 10, 64); err == nil {
@@ -580,15 +580,15 @@ func (c *Connection) handleHeaders(d []byte, unzip *decompressor) error {
 
 	s := c.streams[f.StreamId]
 	if s == nil {
-		return ErrInvalidStream(f.StreamId)
+		return errInvalidStream(f.StreamId)
 	}
 
 	if f.Version != c.version {
-		return ErrStreamVersion{f.StreamId, f.Version}
+		return errStreamVersion{f.StreamId, f.Version}
 	}
 
 	if s.rxFinished {
-		return ErrStreamAlreadyClosed(f.StreamId)
+		return errStreamAlreadyClosed(f.StreamId)
 	}
 
 	if f.Finished {
@@ -614,22 +614,22 @@ func (c *Connection) handleRstStream(d []byte) error {
 		return nil
 	}
 
-	err = ErrStreamProtocol(f.StreamId)
+	err = errStreamProtocol(f.StreamId)
 	switch f.Reason {
 	case rstInvalidStream:
-		err = ErrInvalidStream(f.StreamId)
+		err = errInvalidStream(f.StreamId)
 	case rstRefusedStream:
-		err = ErrRefusedStream(f.StreamId)
+		err = errRefusedStream(f.StreamId)
 	case rstUnsupportedVersion:
-		err = ErrStreamVersion{f.StreamId, c.version}
+		err = errStreamVersion{f.StreamId, c.version}
 	case rstCancel:
-		err = ErrCancel(f.StreamId)
+		err = errCancel(f.StreamId)
 	case rstFlowControlError:
-		err = ErrStreamFlowControl(f.StreamId)
+		err = errStreamFlowControl(f.StreamId)
 	case rstStreamInUse:
-		err = ErrStreamInUse(f.StreamId)
+		err = errStreamInUse(f.StreamId)
 	case rstStreamAlreadyClosed:
-		err = ErrStreamAlreadyClosed(f.StreamId)
+		err = errStreamAlreadyClosed(f.StreamId)
 	}
 
 	// Don't return an error and handle the error locally since we don't
@@ -647,7 +647,7 @@ func (c *Connection) handleSettings(d []byte) error {
 	Log("spdy: rx SETTINGS %+v", f)
 
 	if f.Version != c.version {
-		return ErrSessionVersion(f.Version)
+		return errSessionVersion(f.Version)
 	}
 
 	if !f.HaveWindow {
@@ -677,11 +677,11 @@ func (c *Connection) handleWindowUpdate(d []byte) error {
 
 	s := c.streams[f.StreamId]
 	if s == nil {
-		return ErrInvalidStream(f.StreamId)
+		return errInvalidStream(f.StreamId)
 	}
 
 	if f.Version != c.version {
-		return ErrStreamVersion{f.StreamId, f.Version}
+		return errStreamVersion{f.StreamId, f.Version}
 	}
 
 	s.txLock.Lock()
@@ -701,7 +701,7 @@ func (c *Connection) handlePing(d []byte) error {
 	Log("spdy: rx PING %+v", f)
 
 	if f.Version != c.version {
-		return ErrSessionVersion(f.Version)
+		return errSessionVersion(f.Version)
 	}
 
 	// Ignore loopback pings
@@ -724,7 +724,7 @@ func (c *Connection) handleGoAway(d []byte) error {
 	Log("spdy: rx GO_AWAY %+v", f)
 
 	if f.Version != c.version {
-		return ErrSessionVersion(f.Version)
+		return errSessionVersion(f.Version)
 	}
 
 	// This is so we don't start any streams after this point, and
@@ -734,15 +734,15 @@ func (c *Connection) handleGoAway(d []byte) error {
 	close(c.onGoAway)
 
 	for id, s := range c.streams {
-		err := ErrSessionProtocol
+		err := errSessionProtocol
 
 		switch f.Reason {
 		case rstSuccess:
-			err = ErrGoAway
+			err = errGoAway
 		case rstUnsupportedVersion:
-			err = ErrSessionVersion(c.version)
+			err = errSessionVersion(c.version)
 		case rstFlowControlError:
-			err = ErrSessionFlowControl
+			err = errSessionFlowControl
 		}
 
 		// Reset all streams that we started which are after the last
@@ -765,17 +765,17 @@ func (c *Connection) handleData(d []byte) error {
 
 	s := c.streams[f.StreamId]
 	if s == nil {
-		return ErrInvalidStream(f.StreamId)
+		return errInvalidStream(f.StreamId)
 	}
 
 	if s.rxFinished {
-		return ErrStreamAlreadyClosed(f.StreamId)
+		return errStreamAlreadyClosed(f.StreamId)
 	}
 
 	// The rx pump thread could not give us the entire message due to it
 	// being too large.
 	if length := int(fromBig32(d[4:]) & 0xFFFFFF); length != len(f.Data) {
-		return ErrStreamFlowControl(f.StreamId)
+		return errStreamFlowControl(f.StreamId)
 	}
 
 	s.rxLock.Lock()
@@ -795,7 +795,7 @@ func (c *Connection) handleFrame(d []byte, unzip *decompressor) error {
 	}
 
 	if length := int(fromBig32(d[4:]) & 0xFFFFFF); length+8 != len(d) {
-		return ErrSessionFlowControl
+		return errSessionFlowControl
 	}
 
 	switch code & 0x8000FFFF {

@@ -131,7 +131,7 @@ func (c *Connection) newStream(req *http.Request, txFinished bool, extra *Reques
 // getting a SPDY RST_STREAM (equivalent of an abort).
 func (s *streamRx) Read(buf []byte) (int, error) {
 	if s.rxClosed {
-		return 0, ErrReadAfterClose
+		return 0, errReadAfterClose
 	}
 
 	s.rxLock.Lock()
@@ -245,7 +245,7 @@ func (s *streamTx) Flush() {
 // data.
 func (s *streamTx) Write(data []byte) (n int, err error) {
 	if s.txClosed {
-		return 0, ErrWriteAfterClose
+		return 0, errWriteAfterClose
 	}
 
 	if !s.replyHeaderWritten {

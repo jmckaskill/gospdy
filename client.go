@@ -47,7 +47,7 @@ func (c *Connection) startRequest(parent *stream, req *http.Request, extra *Requ
 	// Send the SYN_REQUEST
 	select {
 	case <-c.onGoAway:
-		return nil, ErrGoAway
+		return nil, errGoAway
 	case c.onStartRequest <- s:
 	}
 
@@ -126,7 +126,7 @@ func (t *Transport) dialProxy(proxy *url.URL, addr string) (net.Conn, error) {
 	}
 
 	if proxy.Scheme != "http" {
-		return nil, ErrUnsupportedProxy(proxy.Scheme)
+		return nil, errUnsupportedProxy(proxy.Scheme)
 	}
 
 	conn, err := dial("tcp", addDefaultPort(proxy.Host, 80))
@@ -267,7 +267,7 @@ reconnect:
 	// away, we need to reconnect. This is due to either the server
 	// sending us a GO_AWAY or the startRequest going through after the
 	// socket has already been closed due to an error or timeout.
-	if err == ErrGoAway {
+	if err == errGoAway {
 		goto reconnect
 	}
 
