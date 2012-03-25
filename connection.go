@@ -418,7 +418,7 @@ func (c *Connection) handleSynStream(d []byte, unzip *decompressor) error {
 		return err
 	}
 
-	Log("spdy: rx SYN_STREAM %+v", f)
+	Log("rx SYN_STREAM %+v\n", f)
 
 	// The remote has reopened an already opened stream. We kill both.
 	// Check this first as if any other check fails and this would've also
@@ -519,7 +519,7 @@ func (c *Connection) handleSynReply(d []byte, unzip *decompressor) error {
 		return err
 	}
 
-	Log("spdy: rx SYN_REPLY %+v", f)
+	Log("rx SYN_REPLY %+v\n", f)
 
 	s := c.streams[f.StreamId]
 	if s == nil {
@@ -576,7 +576,7 @@ func (c *Connection) handleHeaders(d []byte, unzip *decompressor) error {
 		return err
 	}
 
-	Log("spdy: rx HEADERS %+v", f)
+	Log("rx HEADERS %+v\n", f)
 
 	s := c.streams[f.StreamId]
 	if s == nil {
@@ -606,7 +606,7 @@ func (c *Connection) handleRstStream(d []byte) error {
 		return err
 	}
 
-	Log("spdy: rx RST_STREAM %+v", f)
+	Log("rx RST_STREAM %+v\n", f)
 
 	s := c.streams[f.StreamId]
 	if s == nil {
@@ -644,7 +644,7 @@ func (c *Connection) handleSettings(d []byte) error {
 		return err
 	}
 
-	Log("spdy: rx SETTINGS %+v", f)
+	Log("rx SETTINGS %+v\n", f)
 
 	if f.Version != c.version {
 		return errSessionVersion(f.Version)
@@ -673,7 +673,7 @@ func (c *Connection) handleWindowUpdate(d []byte) error {
 		return err
 	}
 
-	Log("spdy: rx WINDOW_UPDATE %+v", f)
+	Log("rx WINDOW_UPDATE %+v\n", f)
 
 	s := c.streams[f.StreamId]
 	if s == nil {
@@ -698,7 +698,7 @@ func (c *Connection) handlePing(d []byte) error {
 		return err
 	}
 
-	Log("spdy: rx PING %+v", f)
+	Log("rx PING %+v\n", f)
 
 	if f.Version != c.version {
 		return errSessionVersion(f.Version)
@@ -721,7 +721,7 @@ func (c *Connection) handleGoAway(d []byte) error {
 		return err
 	}
 
-	Log("spdy: rx GO_AWAY %+v", f)
+	Log("rx GO_AWAY %+v\n", f)
 
 	if f.Version != c.version {
 		return errSessionVersion(f.Version)
@@ -761,7 +761,7 @@ func (c *Connection) handleData(d []byte) error {
 		return err
 	}
 
-	Log("spdy: rx DATA %+v", f)
+	Log("rx DATA &{StreamId:%d Finished:%v Data:len %d}\n", f.StreamId, f.Finished, len(f.Data))
 
 	s := c.streams[f.StreamId]
 	if s == nil {

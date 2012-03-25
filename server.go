@@ -73,7 +73,7 @@ func serve(listener net.Listener, handler http.Handler, fallback chan net.Conn) 
 			return err
 		}
 
-		Log("spdy: accept %s", sock.RemoteAddr())
+		Log("accept %s\n", sock.RemoteAddr())
 
 		// Do the TLS negotation on a seperate thread to avoid
 		// blocking the accept loop

@@ -28,13 +28,16 @@ func sendRequestBody(body io.ReadCloser, s *streamTx) {
 	body.Close()
 }
 
-var DefaultExtra = &RequestExtra{}
+type emptyReply int
+
+func (emptyReply) Read([]byte) (int, error) { return 0, io.EOF }
+func (emptyReply) Close() error             { return nil }
 
 // startRequest starts a new request and starts pushing the request body and
 // waits for the reply (if non unidirectional).
 func (c *Connection) startRequest(parent *stream, req *http.Request, extra *RequestExtra) (resp *http.Response, err error) {
 	if extra == nil {
-		extra = DefaultExtra
+		extra = &RequestExtra{}
 	}
 
 	txFinished := req.Body == nil
@@ -59,11 +62,23 @@ func (c *Connection) startRequest(parent *stream, req *http.Request, extra *Requ
 		go sendRequestBody(body, (*streamTx)(s))
 	}
 
-	// Wait for the reply
+	// For unidirectional requests, we return a fake response as
+	// http.Client expects something
 	if extra.Unidirectional {
-		return nil, nil
+		r := &http.Response{
+			Status:        "200 OK",
+			StatusCode:    200,
+			Proto:         "HTTP/1.0",
+			ProtoMajor:    1,
+			ProtoMinor:    0,
+			Body:          emptyReply(0),
+			ContentLength: -1,
+			Request:       req,
+		}
+		return r, nil
 	}
 
+	// Wait for the reply
 	s.rxLock.Lock()
 	defer s.rxLock.Unlock()
 
@@ -75,11 +90,12 @@ func (c *Connection) startRequest(parent *stream, req *http.Request, extra *Requ
 }
 
 type Transport struct {
+	RequestExtra
+
 	Proxy           func(*http.Request) (*url.URL, error)
 	Dial            func(net, addr string) (c net.Conn, err error)
 	TLSClientConfig *tls.Config
 	FallbackClient  *http.Client
-	RequestExtra    *RequestExtra
 
 	lk          sync.Mutex
 	connections map[string]*Connection // key is proxy_url|host:port
@@ -234,6 +250,8 @@ reconnect:
 			return nil, err
 		}
 
+		Log("negotiated protocol %s", tlsSock.ConnectionState().NegotiatedProtocol)
+
 		switch tlsSock.ConnectionState().NegotiatedProtocol {
 		case "http/1.1":
 			// fallback to a standard HTTPS client
@@ -261,7 +279,7 @@ reconnect:
 	}
 
 	t.lk.Unlock()
-	resp, err = c.startRequest(nil, req, t.RequestExtra)
+	resp, err = c.startRequest(nil, req, &t.RequestExtra)
 
 	// In the case that we missed the connection due to being told to go
 	// away, we need to reconnect. This is due to either the server
