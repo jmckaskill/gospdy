@@ -5,9 +5,9 @@ the built-in http/https client/server in go.
 
 Documentation
 -------------
-Documentation is hosted via godoc. This can also be viewed online via gopkgdoc [1].
+Documentation is hosted via godoc. This can also be viewed online via [gopkgdoc].
 
-[1]: http://gopkgdoc.appspot.com/pkg/github.com/jmckaskill/gospdy
+[gopkgdoc]: http://gopkgdoc.appspot.com/pkg/github.com/jmckaskill/gospdy
 
 License (MIT)
 -------------
