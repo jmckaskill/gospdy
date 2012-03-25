@@ -5,14 +5,13 @@ import (
 	"bytes"
 	"crypto/tls"
 	"fmt"
-	"http"
 	"log"
 	"net"
-	"os"
+	"net/http"
+	"net/url"
 	"runtime/debug"
 	"strconv"
 	"strings"
-	"url"
 )
 
 var Log = func(fmt string, args ...interface{}) {}
@@ -31,11 +30,11 @@ type Connection struct {
 	sendControl      chan frame
 	sendWindowUpdate chan frame
 	sendData         [maxPriorities]chan frame
-	dataSent         chan os.Error
+	dataSent         chan error
 
 	// dispatch thread channels
 	onStartRequest   chan *stream // do not use directly, use startRequest instead
-	onRequestStarted chan os.Error
+	onRequestStarted chan error
 
 	// For requests this happens when response.Body.Close is called. For
 	// replies this happens when the handler function returns.
@@ -54,7 +53,7 @@ type Connection struct {
 
 // nextTxFrame gets the next frame to be written to the socket in prioritized
 // order. If it has to block it will flush the output buffer first.
-func (c *Connection) nextTxFrame(buf *bufio.Writer) (frame, chan os.Error) {
+func (c *Connection) nextTxFrame(buf *bufio.Writer) (frame, chan error) {
 	// try a non-blocking receive in priority order
 
 	// TODO(james): change back to a single select once go issue 2401 is
@@ -132,7 +131,7 @@ func (c *Connection) txPump() {
 // rxPump runs the connection receive loop for both client and server
 // connections. It then finds the message boundaries and sends each one over
 // to the connection thread.
-func (c *Connection) rxPump(dispatch chan []byte, dispatched chan os.Error, rxError chan os.Error) {
+func (c *Connection) rxPump(dispatch chan []byte, dispatched chan error, rxError chan error) {
 
 	buf := new(buffer)
 
@@ -197,8 +196,8 @@ func (c *Connection) Run() {
 	}
 
 	dispatch := make(chan []byte)
-	dispatched := make(chan os.Error)
-	rxError := make(chan os.Error)
+	dispatched := make(chan error)
+	rxError := make(chan error)
 
 	go c.txPump()
 	go c.rxPump(dispatch, dispatched, rxError)
@@ -294,7 +293,7 @@ func (c *Connection) shutdown() {
  * code - in this case the stream succeeded).
  */
 
-func (c *Connection) finishStream(s *stream, err os.Error) {
+func (c *Connection) finishStream(s *stream, err error) {
 	// We use rxError != nil, etc to figure out if we have finished
 	if err == nil {
 		panic("")
@@ -346,7 +345,7 @@ func (c *Connection) sendReset(streamId int, reason int) {
 	}
 }
 
-func (c *Connection) handleStartRequest(s *stream) os.Error {
+func (c *Connection) handleStartRequest(s *stream) error {
 	s.streamId = c.nextStreamId
 	c.nextStreamId += 2
 
@@ -417,7 +416,7 @@ func handlerThread(h http.Handler, s *stream, req *http.Request) {
 	h.ServeHTTP((*streamTxUser)(s), req)
 }
 
-func (c *Connection) handleSynStream(d []byte, unzip *decompressor) os.Error {
+func (c *Connection) handleSynStream(d []byte, unzip *decompressor) error {
 	f, err := parseSynStream(d, unzip)
 	if err != nil {
 		return err
@@ -488,7 +487,7 @@ func (c *Connection) handleSynStream(d []byte, unzip *decompressor) os.Error {
 		TLS:        c.tls,
 	}
 
-	if cl, err := strconv.Atoi64(f.Header.Get("Content-Length")); err != nil {
+	if cl, err := strconv.ParseInt(f.Header.Get("Content-Length"), 10, 64); err != nil {
 		r.ContentLength = cl
 	}
 
@@ -519,7 +518,7 @@ func (c *Connection) handleSynStream(d []byte, unzip *decompressor) os.Error {
 	return nil
 }
 
-func (c *Connection) handleSynReply(d []byte, unzip *decompressor) os.Error {
+func (c *Connection) handleSynReply(d []byte, unzip *decompressor) error {
 	f, err := parseSynReply(d, unzip)
 	if err != nil {
 		return err
@@ -563,7 +562,7 @@ func (c *Connection) handleSynReply(d []byte, unzip *decompressor) os.Error {
 		return ErrStreamProtocol(f.StreamId)
 	}
 
-	if cl, err := strconv.Atoi64(f.Header.Get("Content-Length")); err == nil {
+	if cl, err := strconv.ParseInt(f.Header.Get("Content-Length"), 10, 64); err == nil {
 		r.ContentLength = cl
 	}
 
@@ -576,7 +575,7 @@ func (c *Connection) handleSynReply(d []byte, unzip *decompressor) os.Error {
 	return nil
 }
 
-func (c *Connection) handleHeaders(d []byte, unzip *decompressor) os.Error {
+func (c *Connection) handleHeaders(d []byte, unzip *decompressor) error {
 	f, err := parseHeaders(d, unzip)
 	if err != nil {
 		return err
@@ -606,7 +605,7 @@ func (c *Connection) handleHeaders(d []byte, unzip *decompressor) os.Error {
 	return nil
 }
 
-func (c *Connection) handleRstStream(d []byte) os.Error {
+func (c *Connection) handleRstStream(d []byte) error {
 	f, err := parseRstStream(d)
 	if err != nil {
 		return err
@@ -644,7 +643,7 @@ func (c *Connection) handleRstStream(d []byte) os.Error {
 	return nil
 }
 
-func (c *Connection) handleSettings(d []byte) os.Error {
+func (c *Connection) handleSettings(d []byte) error {
 	f, err := parseSettings(d)
 	if err != nil {
 		return err
@@ -673,7 +672,7 @@ func (c *Connection) handleSettings(d []byte) os.Error {
 	return nil
 }
 
-func (c *Connection) handleWindowUpdate(d []byte) os.Error {
+func (c *Connection) handleWindowUpdate(d []byte) error {
 	f, err := parseWindowUpdate(d)
 	if err != nil {
 		return err
@@ -698,7 +697,7 @@ func (c *Connection) handleWindowUpdate(d []byte) os.Error {
 	return nil
 }
 
-func (c *Connection) handlePing(d []byte) os.Error {
+func (c *Connection) handlePing(d []byte) error {
 	f, err := parsePing(d)
 	if err != nil {
 		return err
@@ -721,7 +720,7 @@ func (c *Connection) handlePing(d []byte) os.Error {
 	return nil
 }
 
-func (c *Connection) handleGoAway(d []byte) os.Error {
+func (c *Connection) handleGoAway(d []byte) error {
 	f, err := parseGoAway(d)
 	if err != nil {
 		return err
@@ -761,7 +760,7 @@ func (c *Connection) handleGoAway(d []byte) os.Error {
 	return nil
 }
 
-func (c *Connection) handleData(d []byte) os.Error {
+func (c *Connection) handleData(d []byte) error {
 	f, err := parseData(d)
 	if err != nil {
 		return err
@@ -802,7 +801,7 @@ func (c *Connection) handleData(d []byte) os.Error {
 	return nil
 }
 
-func (c *Connection) handleFrame(d []byte, unzip *decompressor) os.Error {
+func (c *Connection) handleFrame(d []byte, unzip *decompressor) error {
 	code := fromBig32(d[0:])
 
 	if code&0x80000000 == 0 {
@@ -862,9 +861,9 @@ func NewConnection(sock net.Conn, handler http.Handler, version int, server bool
 		rxWindow:         defaultWindow,
 		sendControl:      make(chan frame, 100),
 		sendWindowUpdate: make(chan frame, 100),
-		dataSent:         make(chan os.Error),
+		dataSent:         make(chan error),
 		onStartRequest:   make(chan *stream),
-		onRequestStarted: make(chan os.Error),
+		onRequestStarted: make(chan error),
 		onStreamFinished: make(chan *stream),
 		streams:          make(map[int]*stream),
 		lastStreamOpened: 0,

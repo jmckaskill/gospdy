@@ -1,9 +1,6 @@
 package spdy
 
-import (
-	"io"
-	"os"
-)
+import "io"
 
 // buffer is a fixed size buffer that is used for receiving data on the
 // session rx thread.
@@ -13,7 +10,7 @@ type buffer struct {
 	buf   [defaultBufferSize * 2]byte
 }
 
-func (s *buffer) Get(r io.Reader, n int) ([]byte, os.Error) {
+func (s *buffer) Get(r io.Reader, n int) ([]byte, error) {
 	// compress the data we already have
 	if s.begin > defaultBufferSize {
 		copy(s.buf[:], s.buf[s.begin:s.end])

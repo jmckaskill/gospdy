@@ -3,14 +3,15 @@ package spdy
 import (
 	"bufio"
 	"crypto/tls"
+	"errors"
 	"fmt"
-	"http"
 	"io"
 	"net"
-	"os"
-	"sync"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"strings"
-	"url"
+	"sync"
 )
 
 var DefaultTransport http.RoundTripper = &Transport{
@@ -35,7 +36,7 @@ var DefaultExtra = &RequestExtra{}
 
 // startRequest starts a new request and starts pushing the request body and
 // waits for the reply (if non unidirectional).
-func (c *Connection) startRequest(parent *stream, req *http.Request, extra *RequestExtra) (resp *http.Response, err os.Error) {
+func (c *Connection) startRequest(parent *stream, req *http.Request, extra *RequestExtra) (resp *http.Response, err error) {
 	if extra == nil {
 		extra = DefaultExtra
 	}
@@ -79,8 +80,8 @@ func (c *Connection) startRequest(parent *stream, req *http.Request, extra *Requ
 }
 
 type Transport struct {
-	Proxy           func(*http.Request) (*url.URL, os.Error)
-	Dial            func(net, addr string) (c net.Conn, err os.Error)
+	Proxy           func(*http.Request) (*url.URL, error)
+	Dial            func(net, addr string) (c net.Conn, err error)
 	TLSClientConfig *tls.Config
 	FallbackClient  *http.Client
 	RequestExtra    *RequestExtra
@@ -118,7 +119,7 @@ func connKey(proxy *url.URL, req *http.Request) string {
 	return strings.Join([]string{proxyStr, hostStr}, "|")
 }
 
-func (t *Transport) dialProxy(proxy *url.URL, addr string) (net.Conn, os.Error) {
+func (t *Transport) dialProxy(proxy *url.URL, addr string) (net.Conn, error) {
 	dial := t.Dial
 	if dial == nil {
 		dial = net.Dial
@@ -140,7 +141,7 @@ func (t *Transport) dialProxy(proxy *url.URL, addr string) (net.Conn, os.Error) 
 
 	req := &http.Request{
 		Method: "CONNECT",
-		URL:    &url.URL{RawPath: addr},
+		URL:    &url.URL{Opaque: addr},
 		Host:   addr,
 		Header: make(http.Header),
 	}
@@ -163,7 +164,7 @@ func (t *Transport) dialProxy(proxy *url.URL, addr string) (net.Conn, os.Error) 
 	if resp.StatusCode != 200 {
 		f := strings.SplitN(resp.Status, " ", 2)
 		conn.Close()
-		return nil, os.NewError(f[1])
+		return nil, errors.New(f[1])
 	}
 
 	return conn, nil
@@ -178,17 +179,17 @@ func (t *Transport) runClient(key string, c *Connection) {
 	t.lk.Unlock()
 }
 
-func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err os.Error) {
+func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error) {
 	if req.URL == nil {
-		return nil, os.NewError("http: nil Request.URL")
+		return nil, errors.New("http: nil Request.URL")
 	}
 	if req.Header == nil {
-		return nil, os.NewError("http: nil Request.Header")
+		return nil, errors.New("http: nil Request.Header")
 	}
 
 	if req.URL.Scheme != "https" {
 		if t.FallbackClient == nil {
-			return nil, os.NewError(fmt.Sprintf("spdy: no fallback client for scheme %s", req.URL.Scheme))
+			return nil, errors.New(fmt.Sprintf("spdy: no fallback client for scheme %s", req.URL.Scheme))
 		}
 
 		return t.FallbackClient.Do(req)
@@ -242,7 +243,7 @@ reconnect:
 		case "http/1.1":
 			// fallback to a standard HTTPS client
 			t.lk.Unlock()
-			client := http.NewClientConn(tlsSock, nil)
+			client := httputil.NewClientConn(tlsSock, nil)
 			resp, err := client.Do(req)
 			client.Close()
 			tlsSock.Close()

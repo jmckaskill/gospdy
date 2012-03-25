@@ -5,11 +5,10 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"fmt"
-	"http"
 	"log"
 	"net"
+	"net/http"
 	"runtime/debug"
-	"os"
 	"time"
 )
 
@@ -62,7 +61,7 @@ func serverConnectThread(sock net.Conn, handler http.Handler, fallback chan net.
 }
 
 // serve runs the server accept loop
-func serve(listener net.Listener, handler http.Handler, fallback chan net.Conn) os.Error {
+func serve(listener net.Listener, handler http.Handler, fallback chan net.Conn) error {
 
 	if handler == nil {
 		handler = http.DefaultServeMux
@@ -87,7 +86,7 @@ func serve(listener net.Listener, handler http.Handler, fallback chan net.Conn) 
 // ListenAndServe listens for unencrypted SPDY connections on addr. Because it
 // does not use TLS/SSL of this it can't use the next protocol negotation in
 // TLS to fall back on standard HTTP.
-func ListenAndServe(addr string, handler http.Handler) os.Error {
+func ListenAndServe(addr string, handler http.Handler) error {
 	if addr == "" {
 		addr = ":http"
 	}
@@ -100,18 +99,18 @@ func ListenAndServe(addr string, handler http.Handler) os.Error {
 
 // ListenAndServeTLS listens for encrpyted SPDY or HTTPS connections on addr.
 // It uses the TLS next negotation protocol to fallback on standard https.
-func ListenAndServeTLS(addr string, certFile string, keyFile string, handler http.Handler) os.Error {
+func ListenAndServeTLS(addr string, certFile string, keyFile string, handler http.Handler) error {
 	if addr == "" {
 		addr = ":https"
 	}
 	cfg := &tls.Config{
 		Rand:         rand.Reader,
-		Time:         time.Seconds,
+		Time:         time.Now,
 		NextProtos:   []string{"spdy/3", "spdy/2", "http/1.1"},
 		Certificates: make([]tls.Certificate, 1),
 	}
 
-	var err os.Error
+	var err error
 	cfg.Certificates[0], err = tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
 		return err
@@ -125,7 +124,7 @@ func ListenAndServeTLS(addr string, certFile string, keyFile string, handler htt
 	tlsListener := tls.NewListener(conn, cfg)
 
 	fallback := &httpsListener{
-		error:  make(chan os.Error),
+		error:  make(chan error),
 		accept: make(chan net.Conn),
 		addr:   tlsListener.Addr(),
 	}
@@ -142,12 +141,12 @@ func ListenAndServeTLS(addr string, certFile string, keyFile string, handler htt
 // This is so that we can hand it connections which negotiate https as their
 // protocol through TLS next protocol negotation.
 type httpsListener struct {
-	error  chan os.Error
+	error  chan error
 	accept chan net.Conn
 	addr   net.Addr
 }
 
-func (s *httpsListener) Accept() (net.Conn, os.Error) {
+func (s *httpsListener) Accept() (net.Conn, error) {
 	select {
 	case err := <-s.error:
 		return nil, err
@@ -157,7 +156,7 @@ func (s *httpsListener) Accept() (net.Conn, os.Error) {
 	panic("unreachable")
 }
 
-func (s *httpsListener) Close() os.Error {
+func (s *httpsListener) Close() error {
 	return nil
 }
 
