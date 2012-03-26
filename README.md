@@ -3,6 +3,11 @@ About
 This is a go library for a SPDY v2/v3 client and server that overlays on top of
 the built-in http/https client/server in go.
 
+[![Build Status][1]][2]
+
+[1]: https://secure.travis-ci.org/jmckaskill/gospdy.png
+[2]: http://www.travis-ci.org/jmckaskill/gospdy
+
 Documentation
 -------------
 Documentation is hosted via godoc. This can be viewed online via [gopkgdoc].
