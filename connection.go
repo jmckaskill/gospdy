@@ -549,9 +549,6 @@ func (c *Connection) handleSynReply(d []byte, unzip *decompressor) error {
 	}
 
 	split := strings.SplitN(f.Status, " ", 2)
-	if len(split) < 2 {
-		return errStreamProtocol(f.StreamId)
-	}
 
 	if r.StatusCode, err = strconv.Atoi(split[0]); err != nil {
 		return errStreamProtocol(f.StreamId)
