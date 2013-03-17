@@ -243,11 +243,13 @@ reconnect:
 			return nil, err
 		}
 
-		if err := tlsSock.VerifyHostname(cfg.ServerName); err != nil {
-			t.lk.Unlock()
-			tlsSock.Close()
-			proxySock.Close()
-			return nil, err
+		if !cfg.InsecureSkipVerify {
+			if err := tlsSock.VerifyHostname(cfg.ServerName); err != nil {
+				t.lk.Unlock()
+				tlsSock.Close()
+				proxySock.Close()
+				return nil, err
+			}
 		}
 
 		Log("negotiated protocol %s", tlsSock.ConnectionState().NegotiatedProtocol)
