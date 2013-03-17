@@ -480,6 +480,7 @@ func (c *Connection) handleSynStream(d []byte, unzip *decompressor) error {
 		Header:     f.Header,
 		Host:       f.URL.Host,
 		RemoteAddr: c.remoteAddr.String(),
+		RequestURI: f.URL.Path,
 		TLS:        c.tls,
 	}
 
