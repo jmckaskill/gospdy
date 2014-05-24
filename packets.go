@@ -309,7 +309,7 @@ func (s *decompressor) Decompress(streamId int, version int, data []byte) (heade
 		numkeys = int(fromBig16(h[:]))
 	case 3:
 		h := [4]byte{}
-		if _, err := s.out.Read(h[:]); err != nil {
+		if _, err := io.ReadFull(s.out, h[:]); err != nil {
 			return nil, err
 		}
 		numkeys = int(fromBig32(h[:]))
@@ -332,7 +332,7 @@ func (s *decompressor) Decompress(streamId int, version int, data []byte) (heade
 			klen = int(fromBig16(h[:]))
 		case 3:
 			h := [4]byte{}
-			if _, err := s.out.Read(h[:]); err != nil {
+			if _, err := io.ReadFull(s.out, h[:]); err != nil {
 				return nil, err
 			}
 			klen = int(fromBig32(h[:]))
@@ -346,7 +346,7 @@ func (s *decompressor) Decompress(streamId int, version int, data []byte) (heade
 		}
 
 		key := make([]byte, klen)
-		if _, err := s.out.Read(key); err != nil {
+		if _, err := io.ReadFull(s.out, key); err != nil {
 			return nil, err
 		}
 
@@ -361,7 +361,7 @@ func (s *decompressor) Decompress(streamId int, version int, data []byte) (heade
 			vlen = int(fromBig16(h[:]))
 		case 3:
 			h := [4]byte{}
-			if _, err := s.out.Read(h[:]); err != nil {
+			if _, err := io.ReadFull(s.out, h[:]); err != nil {
 				return nil, err
 			}
 			vlen = int(fromBig32(h[:]))
@@ -375,7 +375,7 @@ func (s *decompressor) Decompress(streamId int, version int, data []byte) (heade
 		}
 
 		val := make([]byte, vlen)
-		if _, err := s.out.Read(val); err != nil {
+		if _, err := io.ReadFull(s.out, val); err != nil {
 			return nil, err
 		}
 
